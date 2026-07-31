@@ -79,6 +79,78 @@ def get_voice_language(context: ContextTypes.DEFAULT_TYPE) -> str:
     return value if value in {"auto", "en", "es"} else "auto"
 
 
+def get_sarcasm_level(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Per-user tone. Heavy is the default, but users can opt down or out."""
+    value = str(context.user_data.get("sarcasm", "heavy")).lower()
+    return value if value in {"heavy", "light", "off"} else "heavy"
+
+
+def set_sarcasm_level(context: ContextTypes.DEFAULT_TYPE, level: str) -> None:
+    context.user_data["sarcasm"] = level
+
+
+def sarcasm_request(text: str) -> Optional[str]:
+    """Detect commands and natural-language requests to change sarcasm."""
+    lowered = text.lower().strip()
+    if lowered.startswith("/sarcasm"):
+        if re.search(r"\b(off|none|sin|no)\b", lowered):
+            return "off"
+        if re.search(r"\b(light|soft|mild|liviano|ligero|suave)\b", lowered):
+            return "light"
+        if re.search(r"\b(heavy|savage|hard|pesado|fuerte)\b", lowered):
+            return "heavy"
+        return "status"
+    if re.search(r"\b(sin sarcasmo|no sarcasm|sarcasm off|quita(?:r)? el sarcasmo)\b", lowered):
+        return "off"
+    if re.search(r"\b(sarcasmo (?:más )?(?:liviano|ligero|suave)|lighter sarcasm|light sarcasm|menos sarcasmo)\b", lowered):
+        return "light"
+    if re.search(r"\b(sarcasmo (?:pesado|fuerte)|heavy sarcasm|savage mode|más sarcasmo)\b", lowered):
+        return "heavy"
+    return None
+
+
+def sarcasm_line(kind: str, language: str, level: str) -> str:
+    if level == "off":
+        return ""
+    lines = {
+        "es": {
+            "heavy": {
+                "bw": "Ahí tienes el BW. La máquina hizo su parte; ahora intenta tú no arruinarla.",
+                "ft": "Ahí están tus pies. Tranquilo, contar hasta ese número no era requisito para el puesto.",
+                "swrap": "Ese es el nuevo S-Wrap. Ajustarlo sigue siendo trabajo tuyo, campeón.",
+                "mandrel": "Mandril cambiado. Milagrosamente sobrevivimos a una decisión de dos opciones.",
+            },
+            "light": {
+                "bw": "Listo, el BW apareció sin necesidad de sacrificar una calculadora.",
+                "ft": "Aquí están los pies. Fácil cuando alguien más hace las cuentas, ¿verdad?",
+                "swrap": "Nuevo S-Wrap listo. Ahora solo falta que la máquina coopere.",
+                "mandrel": "Mandril cambiado. Misión cumplida.",
+            },
+        },
+        "en": {
+            "heavy": {
+                "bw": "There’s your BW. The machine did its part; try not to ruin yours.",
+                "ft": "There are your feet. Relax, counting that high was never part of the job description.",
+                "swrap": "That’s the new S-Wrap. Adjusting it is still your job, champion.",
+                "mandrel": "Mandrel changed. Somehow we survived a decision with only two options.",
+            },
+            "light": {
+                "bw": "BW is ready—no calculator sacrifice required.",
+                "ft": "Here are the feet. Math is easier when somebody else does it, huh?",
+                "swrap": "New S-Wrap ready. Now we just need the machine to cooperate.",
+                "mandrel": "Mandrel changed. Mission accomplished.",
+            },
+        },
+    }
+    return lines[language][level][kind]
+
+
+def result_with_sarcasm(result: str, kind: str, language: str, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Always place the factual result first, then optional sarcasm."""
+    line = sarcasm_line(kind, language, get_sarcasm_level(context))
+    return f"{result}\n\n_{line}_" if line else result
+
+
 def calculate_bw(weight_lb: float, length_ft: float, mandrel_in: float) -> float:
     return (weight_lb * 453.59237) / ((length_ft * 12 * mandrel_in) / 100)
 
@@ -320,7 +392,7 @@ def help_text(language: str, mandrel: float) -> str:
     voice_lang = "Auto"
     if language == "es":
         return (
-            "🤖 *Viejito — BW Assistant V2.1*\n\n"
+            "🤖 *Viejito — BW Assistant V2.2*\n\n"
             "✍️ Escribe o 🎤 manda una nota de voz.\n"
             f"Mandril actual: *{int(mandrel)}”*\n\n"
             "*BW:* `620 8550`\n"
@@ -328,10 +400,11 @@ def help_text(language: str, mandrel: float) -> str:
             "*S-Wrap:* `7.25 150 6.3` o dilo con palabras\n"
             "*Mandril:* `48` o `51`\n\n"
             "Voz: `/language auto`, `/language es`, `/language en`\n"
-            "Comandos: /bw /ft /swrap /mandrel /language /help"
+            "Sarcasmo: `/sarcasm heavy`, `/sarcasm light`, `/sarcasm off`\n"
+            "Comandos: /bw /ft /swrap /mandrel /language /sarcasm /help"
         )
     return (
-        "🤖 *Viejito — BW Assistant V2.1*\n\n"
+        "🤖 *Viejito — BW Assistant V2.2*\n\n"
         "✍️ Type or 🎤 send a voice note.\n"
         f"Current mandrel: *{int(mandrel)}”*\n\n"
         "*BW:* `620 8550`\n"
@@ -339,7 +412,8 @@ def help_text(language: str, mandrel: float) -> str:
         "*S-Wrap:* `7.25 150 6.3` or say it naturally\n"
         "*Mandrel:* `48` or `51`\n\n"
         "Voice: `/language auto`, `/language es`, `/language en`\n"
-        "Commands: /bw /ft /swrap /mandrel /language /help"
+        "Sarcasm: `/sarcasm heavy`, `/sarcasm light`, `/sarcasm off`\n"
+        "Commands: /bw /ft /swrap /mandrel /language /sarcasm /help"
     )
 
 
@@ -366,6 +440,34 @@ async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
 
+async def sarcasm_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.effective_message.text or ""
+    language = detect_language(text)
+    choice = sarcasm_request(text)
+    if choice in {"heavy", "light", "off"}:
+        set_sarcasm_level(context, choice)
+        if language == "es":
+            labels = {"heavy": "pesado", "light": "liviano", "off": "sin sarcasmo"}
+            await update.effective_message.reply_text(
+                f"✅ Sarcasmo: {labels[choice]}. Los resultados siempre serán reales y exactos."
+            )
+        else:
+            labels = {"heavy": "heavy", "light": "light", "off": "off"}
+            await update.effective_message.reply_text(
+                f"✅ Sarcasm: {labels[choice]}. Results will always remain factual and accurate."
+            )
+        return
+    current = get_sarcasm_level(context)
+    if language == "es":
+        await update.effective_message.reply_text(
+            f"Sarcasmo actual: {current}. Usa /sarcasm heavy, /sarcasm light o /sarcasm off."
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"Current sarcasm: {current}. Use /sarcasm heavy, /sarcasm light, or /sarcasm off."
+        )
+
+
 async def mandrel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.effective_message.text or ""
     language = detect_language(text)
@@ -381,6 +483,8 @@ async def mandrel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if language == "es" else
             f"Current mandrel: {int(current)}”. Use `/mandrel 48` or `/mandrel 51`."
         )
+    if numbers and numbers[0] in VALID_MANDRELS:
+        message = result_with_sarcasm(message, "mandrel", language, context)
     await update.effective_message.reply_text(message, parse_mode="Markdown")
 
 
@@ -400,7 +504,8 @@ async def bw_command(update: Update, context: ContextTypes.DEFAULT_TYPE, source_
     mandrel = explicit or get_mandrel(context)
     result = calculate_bw(weight, length, mandrel)
     suffix = "" if mandrel == DEFAULT_MANDREL else f"\n({int(mandrel)}” mandrel)"
-    await update.effective_message.reply_text(f"*BW = {format_number(result)}*{suffix}", parse_mode="Markdown")
+    result_text = result_with_sarcasm(f"*BW = {format_number(result)}*{suffix}", "bw", language, context)
+    await update.effective_message.reply_text(result_text, parse_mode="Markdown")
 
 
 async def ft_command(update: Update, context: ContextTypes.DEFAULT_TYPE, source_text: Optional[str] = None) -> None:
@@ -420,7 +525,8 @@ async def ft_command(update: Update, context: ContextTypes.DEFAULT_TYPE, source_
     result = calculate_ft(bw, weight, mandrel)
     label = "Pies" if language == "es" else "Feet"
     suffix = "" if mandrel == DEFAULT_MANDREL else f"\n({int(mandrel)}” mandrel)"
-    await update.effective_message.reply_text(f"*{label} = {format_number(result, 2)} ft*{suffix}", parse_mode="Markdown")
+    result_text = result_with_sarcasm(f"*{label} = {format_number(result, 2)} ft*{suffix}", "ft", language, context)
+    await update.effective_message.reply_text(result_text, parse_mode="Markdown")
 
 
 async def swrap_command(update: Update, context: ContextTypes.DEFAULT_TYPE, source_text: Optional[str] = None) -> None:
@@ -437,7 +543,8 @@ async def swrap_command(update: Update, context: ContextTypes.DEFAULT_TYPE, sour
         return
     result = calculate_swrap(current_weight, speed, target_weight)
     label = "Nuevo S-Wrap" if language == "es" else "New S-Wrap"
-    await update.effective_message.reply_text(f"*{label}: {format_number(result, 1)}*", parse_mode="Markdown")
+    result_text = result_with_sarcasm(f"*{label}: {format_number(result, 1)}*", "swrap", language, context)
+    await update.effective_message.reply_text(result_text, parse_mode="Markdown")
 
 
 async def process_text(
@@ -449,6 +556,15 @@ async def process_text(
 ) -> None:
     text = text.strip()
     language = detect_language(text)
+    sarcasm_choice = sarcasm_request(text)
+    if sarcasm_choice is not None:
+        original_text = update.effective_message.text
+        update.effective_message.text = f"/sarcasm {sarcasm_choice}" if sarcasm_choice != "status" else "/sarcasm"
+        try:
+            await sarcasm_command(update, context)
+        finally:
+            update.effective_message.text = original_text
+        return
     selected = standalone_mandrel_command(text)
     if selected is not None:
         set_mandrel(context, selected)
@@ -456,7 +572,8 @@ async def process_text(
             f"✅ Usaré mandril de {int(selected)}”." if language == "es"
             else f"✅ I’ll use a {int(selected)}” mandrel."
         )
-        await update.effective_message.reply_text(response)
+        response = result_with_sarcasm(response, "mandrel", language, context)
+        await update.effective_message.reply_text(response, parse_mode="Markdown")
         return
 
     if text.lower() in {"help", "ayuda"}:
@@ -597,10 +714,11 @@ async def post_init(application: Application) -> None:
         BotCommand("swrap", "Calculate S-Wrap"),
         BotCommand("mandrel", "Set 48 or 51 inch mandrel"),
         BotCommand("language", "Voice language: auto, en, es"),
+        BotCommand("sarcasm", "Sarcasm: heavy, light, off"),
         BotCommand("help", "Examples / Ejemplos"),
     ]
     await application.bot.set_my_commands(commands)
-    logger.info("Viejito V2.1 started. Voice models: %s", MODEL_PATHS)
+    logger.info("Viejito V2.2 started. Voice models: %s", MODEL_PATHS)
 
 
 def main() -> None:
@@ -622,6 +740,7 @@ def main() -> None:
     application.add_handler(CommandHandler("swrap", swrap_command))
     application.add_handler(CommandHandler("mandrel", mandrel_command))
     application.add_handler(CommandHandler("language", language_command))
+    application.add_handler(CommandHandler("sarcasm", sarcasm_command))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
