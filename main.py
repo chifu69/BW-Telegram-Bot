@@ -91,23 +91,65 @@ def calculate_swrap(current_weight: float, current_speed: float, target_weight: 
     return current_weight * current_speed / target_weight
 
 
-def is_swrap_request(text: str) -> bool:
+def contains_any(text: str, terms: tuple[str, ...]) -> bool:
     lowered = text.lower()
-    keywords = (
-        "s-wrap", "s wrap", "swrap", "velocidad", "speed",
-        "peso actual", "current weight", "target weight", "target",
-        "peso deseado", "objetivo", "quiero cambiar", "want to change",
+    return any(term in lowered for term in terms)
+
+
+def is_swrap_request(text: str) -> bool:
+    return contains_any(
+        text,
+        (
+            "s-wrap", "s wrap", "swrap", "velocidad", "speed",
+            "peso actual", "current weight", "target weight",
+            "peso deseado", "objetivo", "target", "desired weight",
+        ),
     )
-    return any(keyword in lowered for keyword in keywords)
 
 
-def is_ft_request(text: str) -> bool:
+def has_weight_unit(text: str) -> bool:
+    return bool(re.search(r"\b(lb|lbs|pound|pounds|libra|libras|peso|weight)\b", text.lower()))
+
+
+def has_length_unit(text: str) -> bool:
+    return bool(re.search(r"\b(ft|feet|foot|pie|pies|largo|longitud|length)\b", text.lower()))
+
+
+def has_bw_word(text: str) -> bool:
+    return bool(re.search(r"\b(bw|basis weight|peso base|gramaje)\b", text.lower()))
+
+
+def is_explicit_ft_request(text: str) -> bool:
     lowered = text.lower().strip()
     return bool(
-        re.search(r"\b(ft|feet|foot|pies|pie|length|longitud)\b", lowered)
-        or lowered.startswith("/ft")
+        lowered.startswith("/ft")
         or lowered.startswith("ft ")
+        or re.search(r"\b(calculate|calcula|calcular|find|dime|cuantos|cuántos|how many)\s+(?:the\s+)?(?:feet|ft|pies)\b", lowered)
+        or re.search(r"\b(?:feet|ft|pies)\s*(?:=|:|result|resultado|needed|necesarios)\b", lowered)
     )
+
+
+def classify_request(text: str) -> str:
+    """Return one of: mandrel, swrap, ft, bw, unknown.
+
+    Important rule: a message containing both a weight and an existing roll
+    length (for example "650 libras 8720 pies") is a BW calculation, not FT.
+    """
+    if standalone_mandrel_command(text) is not None:
+        return "mandrel"
+    explicit = explicit_mandrel(text)
+    numbers = remove_explicit_mandrel_number(text, explicit)
+    if is_swrap_request(text) or len(numbers) >= 3:
+        return "swrap"
+    if is_explicit_ft_request(text):
+        return "ft"
+    if has_weight_unit(text) and has_length_unit(text) and len(numbers) >= 2:
+        return "bw"
+    if has_bw_word(text) and has_weight_unit(text) and len(numbers) >= 2 and not has_length_unit(text):
+        return "ft"
+    if len(numbers) >= 2:
+        return "bw"
+    return "unknown"
 
 
 def explicit_mandrel(text: str) -> Optional[float]:
@@ -278,7 +320,7 @@ def help_text(language: str, mandrel: float) -> str:
     voice_lang = "Auto"
     if language == "es":
         return (
-            "🤖 *Viejito — BW Assistant V2*\n\n"
+            "🤖 *Viejito — BW Assistant V2.1*\n\n"
             "✍️ Escribe o 🎤 manda una nota de voz.\n"
             f"Mandril actual: *{int(mandrel)}”*\n\n"
             "*BW:* `620 8550`\n"
@@ -289,7 +331,7 @@ def help_text(language: str, mandrel: float) -> str:
             "Comandos: /bw /ft /swrap /mandrel /language /help"
         )
     return (
-        "🤖 *Viejito — BW Assistant V2*\n\n"
+        "🤖 *Viejito — BW Assistant V2.1*\n\n"
         "✍️ Type or 🎤 send a voice note.\n"
         f"Current mandrel: *{int(mandrel)}”*\n\n"
         "*BW:* `620 8550`\n"
@@ -398,7 +440,13 @@ async def swrap_command(update: Update, context: ContextTypes.DEFAULT_TYPE, sour
     await update.effective_message.reply_text(f"*{label}: {format_number(result, 1)}*", parse_mode="Markdown")
 
 
-async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+async def process_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    from_voice: bool = False,
+) -> None:
     text = text.strip()
     language = detect_language(text)
     selected = standalone_mandrel_command(text)
@@ -410,18 +458,49 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         )
         await update.effective_message.reply_text(response)
         return
+
     if text.lower() in {"help", "ayuda"}:
-        await update.effective_message.reply_text(help_text(language, get_mandrel(context)), parse_mode="Markdown")
+        await update.effective_message.reply_text(
+            help_text(language, get_mandrel(context)), parse_mode="Markdown"
+        )
         return
-    if is_swrap_request(text) or (len(extract_numbers(text)) >= 3 and not is_ft_request(text)):
+
+    intent = classify_request(text)
+    numbers = extract_numbers(text)
+
+    if from_voice and intent in {"bw", "ft", "swrap"}:
+        if intent == "bw" and len(numbers) >= 2:
+            summary = (
+                f"🎤 Entendí: peso {format_number(numbers[0])} lb, largo {format_number(numbers[1])} ft"
+                if language == "es" else
+                f"🎤 I heard: weight {format_number(numbers[0])} lb, length {format_number(numbers[1])} ft"
+            )
+        elif intent == "ft" and len(numbers) >= 2:
+            summary = (
+                f"🎤 Entendí: BW {format_number(numbers[0])}, peso {format_number(numbers[1])} lb"
+                if language == "es" else
+                f"🎤 I heard: BW {format_number(numbers[0])}, weight {format_number(numbers[1])} lb"
+            )
+        elif len(numbers) >= 3:
+            summary = (
+                f"🎤 Entendí: actual {format_number(numbers[0])}, velocidad {format_number(numbers[1])}, objetivo {format_number(numbers[2])}"
+                if language == "es" else
+                f"🎤 I heard: current {format_number(numbers[0])}, speed {format_number(numbers[1])}, target {format_number(numbers[2])}"
+            )
+        else:
+            summary = f"🎤 {text}"
+        await update.effective_message.reply_text(summary)
+
+    if intent == "swrap":
         await swrap_command(update, context, text)
         return
-    if is_ft_request(text):
+    if intent == "ft":
         await ft_command(update, context, text)
         return
-    if len(extract_numbers(text)) >= 2:
+    if intent == "bw":
         await bw_command(update, context, text)
         return
+
     response = (
         "No pude identificar el cálculo. Escribe *Ayuda*." if language == "es"
         else "I couldn’t identify the calculation. Type *Help*."
@@ -498,7 +577,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await status.edit_text("No pude entender el audio. / I couldn’t understand the audio.")
             return
         await status.edit_text(f"🎤 {text}")
-        await process_text(update, context, text)
+        await process_text(update, context, text, from_voice=True)
     except Exception:
         logger.exception("Voice processing failed")
         await status.edit_text(
@@ -521,7 +600,7 @@ async def post_init(application: Application) -> None:
         BotCommand("help", "Examples / Ejemplos"),
     ]
     await application.bot.set_my_commands(commands)
-    logger.info("Viejito V2 started. Voice models: %s", MODEL_PATHS)
+    logger.info("Viejito V2.1 started. Voice models: %s", MODEL_PATHS)
 
 
 def main() -> None:
