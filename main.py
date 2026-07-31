@@ -1,6 +1,12 @@
+import asyncio
+import gc
+import json
 import logging
 import os
 import re
+import subprocess
+import tempfile
+import wave
 from pathlib import Path
 from typing import Optional
 
@@ -13,32 +19,38 @@ from telegram.ext import (
     PicklePersistence,
     filters,
 )
+from vosk import KaldiRecognizer, Model, SetLogLevel
 
 TOKEN_ENV = "BOT_TOKEN"
 DEFAULT_MANDREL = 48.0
 VALID_MANDRELS = {48.0, 51.0}
 PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "bot_data.pkl")
+MODEL_ROOT = Path(os.getenv("VOSK_MODEL_ROOT", "/app/models"))
+MODEL_PATHS = {
+    "en": MODEL_ROOT / "vosk-model-small-en-us-0.15",
+    "es": MODEL_ROOT / "vosk-model-small-es-0.42",
+}
+MAX_VOICE_SECONDS = 30
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+SetLogLevel(-1)
 
 
 def detect_language(text: str) -> str:
-    """Return 'es' or 'en' using lightweight keyword detection."""
     lowered = text.lower()
     spanish_words = (
         "cuánto", "cuanto", "peso", "libras", "pies", "mandril", "calcula",
         "quiero", "cambiar", "subir", "bajar", "velocidad", "actual", "ayuda",
-        "usar", "usa", "nuevo", "nueva"
+        "usar", "usa", "nuevo", "nueva", "objetivo", "deseado",
     )
     return "es" if any(word in lowered for word in spanish_words) else "en"
 
 
 def extract_numbers(text: str) -> list[float]:
-    """Extract positive decimal numbers, accepting commas as decimal separators."""
     normalized = text.replace(",", ".")
     values = re.findall(r"(?<![\w.])-?\d+(?:\.\d+)?", normalized)
     return [float(value) for value in values]
@@ -62,13 +74,16 @@ def set_mandrel(context: ContextTypes.DEFAULT_TYPE, mandrel: float) -> None:
     context.user_data["mandrel"] = mandrel
 
 
+def get_voice_language(context: ContextTypes.DEFAULT_TYPE) -> str:
+    value = str(context.user_data.get("voice_language", "auto")).lower()
+    return value if value in {"auto", "en", "es"} else "auto"
+
+
 def calculate_bw(weight_lb: float, length_ft: float, mandrel_in: float) -> float:
-    # Same formula used by the BW Tools web app.
     return (weight_lb * 453.59237) / ((length_ft * 12 * mandrel_in) / 100)
 
 
 def calculate_ft(bw: float, weight_lb: float, mandrel_in: float) -> float:
-    # Reverse of the BW formula.
     return (weight_lb * 453.59237 * 100) / (bw * 12 * mandrel_in)
 
 
@@ -80,8 +95,8 @@ def is_swrap_request(text: str) -> bool:
     lowered = text.lower()
     keywords = (
         "s-wrap", "s wrap", "swrap", "velocidad", "speed",
-        "peso actual", "current weight", "target weight",
-        "peso deseado", "quiero cambiar", "want to change"
+        "peso actual", "current weight", "target weight", "target",
+        "peso deseado", "objetivo", "quiero cambiar", "want to change",
     )
     return any(keyword in lowered for keyword in keywords)
 
@@ -125,7 +140,6 @@ def remove_explicit_mandrel_number(text: str, mandrel: Optional[float]) -> list[
     numbers = extract_numbers(text)
     if mandrel is None:
         return numbers
-
     removed = False
     result: list[float] = []
     for number in numbers:
@@ -136,227 +150,385 @@ def remove_explicit_mandrel_number(text: str, mandrel: Optional[float]) -> list[
     return result
 
 
+EN_SMALL = {
+    "zero": 0, "oh": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+ES_SMALL = {
+    "cero": 0, "uno": 1, "una": 1, "un": 1, "dos": 2, "tres": 3, "cuatro": 4,
+    "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9, "diez": 10,
+    "once": 11, "doce": 12, "trece": 13, "catorce": 14, "quince": 15,
+    "dieciseis": 16, "dieciséis": 16, "diecisiete": 17, "dieciocho": 18,
+    "diecinueve": 19, "veinte": 20, "veintiuno": 21, "veintidos": 22,
+    "veintidós": 22, "veintitres": 23, "veintitrés": 23, "veinticuatro": 24,
+    "veinticinco": 25, "veintiseis": 26, "veintiséis": 26, "veintisiete": 27,
+    "veintiocho": 28, "veintinueve": 29, "treinta": 30, "cuarenta": 40,
+    "cincuenta": 50, "sesenta": 60, "setenta": 70, "ochenta": 80, "noventa": 90,
+    "cien": 100, "ciento": 100, "doscientos": 200, "trescientos": 300,
+    "cuatrocientos": 400, "quinientos": 500, "seiscientos": 600,
+    "setecientos": 700, "ochocientos": 800, "novecientos": 900,
+}
+
+
+def _parse_en_integer(words: list[str]) -> Optional[int]:
+    total = current = 0
+    used = False
+    for word in words:
+        if word == "and":
+            continue
+        if word in EN_SMALL:
+            current += EN_SMALL[word]
+            used = True
+        elif word == "hundred":
+            current = max(current, 1) * 100
+            used = True
+        elif word == "thousand":
+            total += max(current, 1) * 1000
+            current = 0
+            used = True
+        else:
+            return None
+    return total + current if used else None
+
+
+def _parse_es_integer(words: list[str]) -> Optional[int]:
+    total = current = 0
+    used = False
+    for word in words:
+        if word == "y":
+            continue
+        if word in ES_SMALL:
+            value = ES_SMALL[word]
+            if value >= 100:
+                current += value
+            else:
+                current += value
+            used = True
+        elif word in {"mil", "miles"}:
+            total += max(current, 1) * 1000
+            current = 0
+            used = True
+        else:
+            return None
+    return total + current if used else None
+
+
+def _number_phrase_to_string(words: list[str], language: str) -> Optional[str]:
+    decimal_markers = {"en": {"point", "dot"}, "es": {"punto", "coma"}}[language]
+    split_at = next((i for i, w in enumerate(words) if w in decimal_markers), None)
+    integer_words = words if split_at is None else words[:split_at]
+    decimal_words = [] if split_at is None else words[split_at + 1:]
+    parser = _parse_en_integer if language == "en" else _parse_es_integer
+    integer = parser(integer_words)
+    if integer is None:
+        return None
+    if not decimal_words:
+        return str(integer)
+    digit_map = EN_SMALL if language == "en" else ES_SMALL
+    digits: list[str] = []
+    for word in decimal_words:
+        if word in digit_map and 0 <= digit_map[word] <= 9:
+            digits.append(str(digit_map[word]))
+        else:
+            parsed = parser(decimal_words)
+            if parsed is None:
+                return None
+            digits = list(str(parsed))
+            break
+    return f"{integer}.{''.join(digits)}" if digits else str(integer)
+
+
+def normalize_spoken_numbers(text: str, language: str) -> str:
+    tokens = re.findall(r"[\wáéíóúüñ]+|[^\w\s]", text.lower(), flags=re.UNICODE)
+    vocab = set(EN_SMALL if language == "en" else ES_SMALL)
+    extras = {"en": {"and", "hundred", "thousand", "point", "dot"},
+              "es": {"y", "mil", "miles", "punto", "coma"}}[language]
+    allowed = vocab | extras
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        if tokens[i] not in allowed:
+            out.append(tokens[i])
+            i += 1
+            continue
+        best_value = None
+        best_end = i
+        for j in range(i + 1, min(len(tokens), i + 12) + 1):
+            phrase = tokens[i:j]
+            if not all(token in allowed for token in phrase):
+                break
+            value = _number_phrase_to_string(phrase, language)
+            if value is not None:
+                best_value = value
+                best_end = j
+        if best_value is None:
+            out.append(tokens[i])
+            i += 1
+        else:
+            out.append(best_value)
+            i = best_end
+    return " ".join(out).replace(" .", ".").replace(" ,", ",")
+
+
 def help_text(language: str, mandrel: float) -> str:
+    voice_lang = "Auto"
     if language == "es":
         return (
-            "🤖 *BW Assistant*\n\n"
-            f"Mandril predeterminado: *{int(mandrel)}”*\n\n"
-            "*Basis Weight*\n"
-            "`620 8550`\n"
-            "`620 lb 8550 ft mandril 51`\n\n"
-            "*Calcular pies*\n"
-            "`FT 5.71 620`\n"
-            "`¿Cuántos pies con BW 5.71 y peso 620?`\n\n"
-            "*S-Wrap*\n"
-            "`Peso actual 7.25, velocidad 150, quiero 6.3`\n\n"
-            "*Cambiar mandril*\n"
-            "`48` o `51`\n\n"
-            "Comandos: /bw, /ft, /swrap, /mandrel, /help"
+            "🤖 *Viejito — BW Assistant V2*\n\n"
+            "✍️ Escribe o 🎤 manda una nota de voz.\n"
+            f"Mandril actual: *{int(mandrel)}”*\n\n"
+            "*BW:* `620 8550`\n"
+            "*FT:* `FT 5.71 620`\n"
+            "*S-Wrap:* `7.25 150 6.3` o dilo con palabras\n"
+            "*Mandril:* `48` o `51`\n\n"
+            "Voz: `/language auto`, `/language es`, `/language en`\n"
+            "Comandos: /bw /ft /swrap /mandrel /language /help"
         )
     return (
-        "🤖 *BW Assistant*\n\n"
-        f"Default mandrel: *{int(mandrel)}”*\n\n"
-        "*Basis Weight*\n"
-        "`620 8550`\n"
-        "`620 lb 8550 ft 51-inch mandrel`\n\n"
-        "*Calculate feet*\n"
-        "`FT 5.71 620`\n"
-        "`How many feet with BW 5.71 and weight 620?`\n\n"
-        "*S-Wrap*\n"
-        "`Current weight 7.25, speed 150, target 6.3`\n\n"
-        "*Change mandrel*\n"
-        "`48` or `51`\n\n"
-        "Commands: /bw, /ft, /swrap, /mandrel, /help"
+        "🤖 *Viejito — BW Assistant V2*\n\n"
+        "✍️ Type or 🎤 send a voice note.\n"
+        f"Current mandrel: *{int(mandrel)}”*\n\n"
+        "*BW:* `620 8550`\n"
+        "*FT:* `FT 5.71 620`\n"
+        "*S-Wrap:* `7.25 150 6.3` or say it naturally\n"
+        "*Mandrel:* `48` or `51`\n\n"
+        "Voice: `/language auto`, `/language es`, `/language en`\n"
+        "Commands: /bw /ft /swrap /mandrel /language /help"
     )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     language = detect_language(update.effective_message.text or "")
-    await update.effective_message.reply_text(
-        help_text(language, get_mandrel(context)),
-        parse_mode="Markdown",
-    )
+    await update.effective_message.reply_text(help_text(language, get_mandrel(context)), parse_mode="Markdown")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    language = detect_language(update.effective_message.text or "")
-    await update.effective_message.reply_text(
-        help_text(language, get_mandrel(context)),
-        parse_mode="Markdown",
-    )
+    await start(update, context)
+
+
+async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.effective_message.text or "").lower()
+    choice = next((x for x in ("auto", "en", "es") if re.search(rf"\b{x}\b", text)), None)
+    if choice:
+        context.user_data["voice_language"] = choice
+        labels = {"auto": "automático / automatic", "en": "English", "es": "Español"}
+        await update.effective_message.reply_text(f"🎤 Voice language: {labels[choice]}")
+    else:
+        current = get_voice_language(context)
+        await update.effective_message.reply_text(
+            f"Current voice language: {current}\nUse /language auto, /language es, or /language en"
+        )
 
 
 async def mandrel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.effective_message.text or ""
     language = detect_language(text)
     numbers = extract_numbers(text)
-
     if numbers and numbers[0] in VALID_MANDRELS:
         mandrel = numbers[0]
         set_mandrel(context, mandrel)
-        message = (
-            f"✅ Mandril predeterminado: {int(mandrel)}”"
-            if language == "es"
-            else f"✅ Default mandrel: {int(mandrel)}”"
-        )
+        message = f"✅ Mandril: {int(mandrel)}”" if language == "es" else f"✅ Mandrel: {int(mandrel)}”"
     else:
         current = get_mandrel(context)
         message = (
             f"Mandril actual: {int(current)}”. Usa `/mandrel 48` o `/mandrel 51`."
-            if language == "es"
-            else f"Current mandrel: {int(current)}”. Use `/mandrel 48` or `/mandrel 51`."
+            if language == "es" else
+            f"Current mandrel: {int(current)}”. Use `/mandrel 48` or `/mandrel 51`."
         )
     await update.effective_message.reply_text(message, parse_mode="Markdown")
 
 
-async def bw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.effective_message.text or ""
+async def bw_command(update: Update, context: ContextTypes.DEFAULT_TYPE, source_text: Optional[str] = None) -> None:
+    text = source_text if source_text is not None else (update.effective_message.text or "")
     language = detect_language(text)
     explicit = explicit_mandrel(text)
     numbers = remove_explicit_mandrel_number(text, explicit)
-
-    # Remove command itself; extract_numbers already ignores "/bw".
     if len(numbers) < 2:
-        message = (
-            "Escribe: `/bw peso pies` — ejemplo: `/bw 620 8550`"
-            if language == "es"
-            else "Enter: `/bw weight feet` — example: `/bw 620 8550`"
-        )
+        message = "Escribe: `/bw peso pies`" if language == "es" else "Enter: `/bw weight feet`"
         await update.effective_message.reply_text(message, parse_mode="Markdown")
         return
-
     weight, length = numbers[0], numbers[1]
+    if weight <= 0 or length <= 0:
+        await update.effective_message.reply_text("Weight and feet must be greater than zero.")
+        return
     mandrel = explicit or get_mandrel(context)
     result = calculate_bw(weight, length, mandrel)
-    await update.effective_message.reply_text(
-        f"*BW = {format_number(result)}*\nMandrel: {int(mandrel)}”",
-        parse_mode="Markdown",
-    )
+    suffix = "" if mandrel == DEFAULT_MANDREL else f"\n({int(mandrel)}” mandrel)"
+    await update.effective_message.reply_text(f"*BW = {format_number(result)}*{suffix}", parse_mode="Markdown")
 
 
-async def ft_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.effective_message.text or ""
+async def ft_command(update: Update, context: ContextTypes.DEFAULT_TYPE, source_text: Optional[str] = None) -> None:
+    text = source_text if source_text is not None else (update.effective_message.text or "")
     language = detect_language(text)
     explicit = explicit_mandrel(text)
     numbers = remove_explicit_mandrel_number(text, explicit)
-
     if len(numbers) < 2:
-        message = (
-            "Escribe: `/ft BW peso` — ejemplo: `/ft 5.71 620`"
-            if language == "es"
-            else "Enter: `/ft BW weight` — example: `/ft 5.71 620`"
-        )
+        message = "Escribe: `/ft BW peso`" if language == "es" else "Enter: `/ft BW weight`"
         await update.effective_message.reply_text(message, parse_mode="Markdown")
         return
-
     bw, weight = numbers[0], numbers[1]
+    if bw <= 0 or weight <= 0:
+        await update.effective_message.reply_text("BW and weight must be greater than zero.")
+        return
     mandrel = explicit or get_mandrel(context)
     result = calculate_ft(bw, weight, mandrel)
     label = "Pies" if language == "es" else "Feet"
-    await update.effective_message.reply_text(
-        f"*{label} = {format_number(result, 2)} ft*\nMandrel: {int(mandrel)}”",
-        parse_mode="Markdown",
-    )
+    suffix = "" if mandrel == DEFAULT_MANDREL else f"\n({int(mandrel)}” mandrel)"
+    await update.effective_message.reply_text(f"*{label} = {format_number(result, 2)} ft*{suffix}", parse_mode="Markdown")
 
 
-async def swrap_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.effective_message.text or ""
+async def swrap_command(update: Update, context: ContextTypes.DEFAULT_TYPE, source_text: Optional[str] = None) -> None:
+    text = source_text if source_text is not None else (update.effective_message.text or "")
     language = detect_language(text)
     numbers = extract_numbers(text)
-
     if len(numbers) < 3:
-        message = (
-            "Escribe: `/swrap peso_actual velocidad_actual peso_deseado`\n"
-            "Ejemplo: `/swrap 7.25 150 6.3`"
-            if language == "es"
-            else "Enter: `/swrap current_weight current_speed target_weight`\n"
-            "Example: `/swrap 7.25 150 6.3`"
-        )
+        message = "Escribe: `/swrap peso velocidad objetivo`" if language == "es" else "Enter: `/swrap current-weight speed target-weight`"
         await update.effective_message.reply_text(message, parse_mode="Markdown")
         return
-
-    current_weight, current_speed, target_weight = numbers[:3]
-    result = calculate_swrap(current_weight, current_speed, target_weight)
-    if language == "es":
-        direction = "Sube" if result > current_speed else "Baja"
-        message = f"*{direction} el S-Wrap a {format_number(result, 1)}*"
-    else:
-        direction = "Increase" if result > current_speed else "Decrease"
-        message = f"*{direction} the S-Wrap to {format_number(result, 1)}*"
-    await update.effective_message.reply_text(message, parse_mode="Markdown")
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if not message or not message.text:
+    current_weight, speed, target_weight = numbers[:3]
+    if min(current_weight, speed, target_weight) <= 0:
+        await update.effective_message.reply_text("All values must be greater than zero.")
         return
+    result = calculate_swrap(current_weight, speed, target_weight)
+    label = "Nuevo S-Wrap" if language == "es" else "New S-Wrap"
+    await update.effective_message.reply_text(f"*{label}: {format_number(result, 1)}*", parse_mode="Markdown")
 
-    text = message.text.strip()
+
+async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    text = text.strip()
     language = detect_language(text)
-
     selected = standalone_mandrel_command(text)
     if selected is not None:
         set_mandrel(context, selected)
         response = (
-            f"✅ Usaré mandril de {int(selected)}” hasta que lo cambies."
-            if language == "es"
-            else f"✅ I’ll use a {int(selected)}” mandrel until you change it."
+            f"✅ Usaré mandril de {int(selected)}”." if language == "es"
+            else f"✅ I’ll use a {int(selected)}” mandrel."
         )
-        await message.reply_text(response)
+        await update.effective_message.reply_text(response)
         return
-
     if text.lower() in {"help", "ayuda"}:
-        await message.reply_text(
-            help_text(language, get_mandrel(context)),
-            parse_mode="Markdown",
-        )
+        await update.effective_message.reply_text(help_text(language, get_mandrel(context)), parse_mode="Markdown")
         return
-
-    if is_swrap_request(text):
-        await swrap_command(update, context)
+    if is_swrap_request(text) or (len(extract_numbers(text)) >= 3 and not is_ft_request(text)):
+        await swrap_command(update, context, text)
         return
-
     if is_ft_request(text):
-        await ft_command(update, context)
+        await ft_command(update, context, text)
         return
-
-    numbers = extract_numbers(text)
-    if len(numbers) >= 2:
-        await bw_command(update, context)
+    if len(extract_numbers(text)) >= 2:
+        await bw_command(update, context, text)
         return
-
     response = (
-        "No pude identificar el cálculo. Escribe *Ayuda* para ver ejemplos."
-        if language == "es"
-        else "I couldn’t identify the calculation. Type *Help* for examples."
+        "No pude identificar el cálculo. Escribe *Ayuda*." if language == "es"
+        else "I couldn’t identify the calculation. Type *Help*."
     )
-    await message.reply_text(response, parse_mode="Markdown")
+    await update.effective_message.reply_text(response, parse_mode="Markdown")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_message and update.effective_message.text:
+        await process_text(update, context, update.effective_message.text)
+
+
+def convert_to_wav(source: Path, destination: Path) -> None:
+    command = [
+        "ffmpeg", "-y", "-loglevel", "error", "-i", str(source),
+        "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", str(destination),
+    ]
+    subprocess.run(command, check=True, timeout=45)
+
+
+def transcribe_wav(wav_path: Path, language: str) -> tuple[str, float]:
+    model_path = MODEL_PATHS[language]
+    if not model_path.exists():
+        raise FileNotFoundError(f"Missing Vosk model: {model_path}")
+    model = Model(str(model_path))
+    with wave.open(str(wav_path), "rb") as audio:
+        recognizer = KaldiRecognizer(model, audio.getframerate())
+        recognizer.SetWords(True)
+        while True:
+            data = audio.readframes(4000)
+            if not data:
+                break
+            recognizer.AcceptWaveform(data)
+        result = json.loads(recognizer.FinalResult())
+    text = result.get("text", "").strip()
+    words = result.get("result", [])
+    confidence = sum(float(item.get("conf", 0)) for item in words) / len(words) if words else 0.0
+    del model
+    gc.collect()
+    return text, confidence
+
+
+def transcribe_best(wav_path: Path, preference: str) -> tuple[str, str, float]:
+    languages = [preference] if preference in {"en", "es"} else ["en", "es"]
+    candidates: list[tuple[str, str, float]] = []
+    for language in languages:
+        text, confidence = transcribe_wav(wav_path, language)
+        normalized = normalize_spoken_numbers(text, language)
+        number_bonus = min(len(extract_numbers(normalized)) * 0.08, 0.24)
+        keyword_bonus = 0.08 if any(k in normalized for k in ("weight", "peso", "feet", "pies", "speed", "velocidad", "mandrel", "mandril")) else 0
+        candidates.append((normalized, language, confidence + number_bonus + keyword_bonus))
+    return max(candidates, key=lambda item: item[2])
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.voice:
+        return
+    if message.voice.duration and message.voice.duration > MAX_VOICE_SECONDS:
+        await message.reply_text("Voice note is too long. Maximum: 30 seconds.")
+        return
+    status = await message.reply_text("🎤 Escuchando… / Listening…")
+    try:
+        telegram_file = await context.bot.get_file(message.voice.file_id)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ogg_path = Path(tmpdir) / "voice.ogg"
+            wav_path = Path(tmpdir) / "voice.wav"
+            await telegram_file.download_to_drive(custom_path=str(ogg_path))
+            await asyncio.to_thread(convert_to_wav, ogg_path, wav_path)
+            text, language, score = await asyncio.to_thread(
+                transcribe_best, wav_path, get_voice_language(context)
+            )
+        if not text:
+            await status.edit_text("No pude entender el audio. / I couldn’t understand the audio.")
+            return
+        await status.edit_text(f"🎤 {text}")
+        await process_text(update, context, text)
+    except Exception:
+        logger.exception("Voice processing failed")
+        await status.edit_text(
+            "No pude procesar el audio. Inténtalo otra vez. / I couldn’t process the audio. Try again."
+        )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled bot error", exc_info=context.error)
 
 
 async def post_init(application: Application) -> None:
-    await application.bot.set_my_commands(
-        [
-            BotCommand("start", "Open BW Assistant"),
-            BotCommand("bw", "Calculate Basis Weight"),
-            BotCommand("ft", "Calculate roll length"),
-            BotCommand("swrap", "Calculate S-Wrap speed"),
-            BotCommand("mandrel", "Set 48 or 51-inch mandrel"),
-            BotCommand("help", "Show examples"),
-        ]
-    )
+    commands = [
+        BotCommand("start", "Start / Empezar"),
+        BotCommand("bw", "Calculate Basis Weight"),
+        BotCommand("ft", "Calculate feet"),
+        BotCommand("swrap", "Calculate S-Wrap"),
+        BotCommand("mandrel", "Set 48 or 51 inch mandrel"),
+        BotCommand("language", "Voice language: auto, en, es"),
+        BotCommand("help", "Examples / Ejemplos"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("Viejito V2 started. Voice models: %s", MODEL_PATHS)
 
 
 def main() -> None:
     token = os.getenv(TOKEN_ENV)
     if not token:
-        raise RuntimeError(
-            f"Missing {TOKEN_ENV}. Add it as a Railway environment variable."
-        )
-
-    persistence_path = Path(PERSISTENCE_FILE)
-    persistence_path.parent.mkdir(parents=True, exist_ok=True)
-    persistence = PicklePersistence(filepath=persistence_path)
-
+        raise RuntimeError(f"Missing required environment variable: {TOKEN_ENV}")
+    persistence = PicklePersistence(filepath=Path(PERSISTENCE_FILE))
     application = (
         Application.builder()
         .token(token)
@@ -364,16 +536,16 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
-
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("mandrel", mandrel_command))
     application.add_handler(CommandHandler("bw", bw_command))
     application.add_handler(CommandHandler("ft", ft_command))
     application.add_handler(CommandHandler("swrap", swrap_command))
+    application.add_handler(CommandHandler("mandrel", mandrel_command))
+    application.add_handler(CommandHandler("language", language_command))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("BW Assistant is starting.")
+    application.add_error_handler(error_handler)
     application.run_polling(drop_pending_updates=True)
 
 

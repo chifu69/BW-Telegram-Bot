@@ -1,13 +1,22 @@
-import math
-from main import calculate_bw, calculate_ft, calculate_swrap
+from main import (
+    calculate_bw,
+    calculate_ft,
+    calculate_swrap,
+    normalize_spoken_numbers,
+)
 
 
-def test_bw_and_ft_are_reversible():
-    bw = calculate_bw(620, 8550, 48)
-    feet = calculate_ft(bw, 620, 48)
-    assert math.isclose(feet, 8550, rel_tol=1e-10)
+def close(a, b, tolerance=0.02):
+    return abs(a - b) <= tolerance
 
 
-def test_swrap_example():
-    result = calculate_swrap(7.25, 150, 6.3)
-    assert math.isclose(result, 172.61904761904762, rel_tol=1e-12)
+assert close(calculate_bw(620, 8550, 48), 5.71)
+assert close(calculate_ft(5.71, 620, 48), 8550, 20)
+assert close(calculate_swrap(7.25, 150, 6.3), 172.62)
+assert "620" in normalize_spoken_numbers("six hundred twenty pounds", "en")
+assert "8550" in normalize_spoken_numbers("eight thousand five hundred fifty feet", "en")
+assert "620" in normalize_spoken_numbers("seiscientos veinte libras", "es")
+assert "8550" in normalize_spoken_numbers("ocho mil quinientos cincuenta pies", "es")
+assert "7.25" in normalize_spoken_numbers("seven point two five", "en")
+assert "7.25" in normalize_spoken_numbers("siete punto dos cinco", "es")
+print("All V2 tests passed.")

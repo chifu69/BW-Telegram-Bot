@@ -1,1 +1,2 @@
 python-telegram-bot==22.8
+vosk==0.3.45

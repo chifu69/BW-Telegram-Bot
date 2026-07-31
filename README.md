@@ -1,134 +1,56 @@
-# BW Assistant — Telegram Bot
+# Viejito — BW Assistant V2
 
-Bilingual Telegram bot for production calculations in English and Spanish.
+Telegram production calculator with **text and free offline voice recognition**.
 
 ## Features
 
-- Calculates Basis Weight from weight and roll length.
-- Calculates roll length in feet from Basis Weight and weight.
-- Calculates a new S-Wrap speed.
-- Uses a 48-inch mandrel by default.
-- Accepts a 51-inch mandrel when specified.
-- Remembers each Telegram user's selected mandrel.
-- Understands short numeric inputs and natural phrases in English or Spanish.
+- Basis Weight calculations
+- Feet calculations
+- S-Wrap calculations
+- 48-inch and 51-inch mandrel memory per user
+- English and Spanish text
+- English and Spanish Telegram voice notes
+- No OpenAI key and no paid speech API
+- Voice processing with Vosk and FFmpeg
 
-## Examples
+## Voice examples
 
-### Basis Weight
+Say one of these in a Telegram voice note:
 
-```text
-620 8550
-620 lb 8550 ft
-620 libras 8550 pies
-/bw 620 8550
-620 lb 8550 ft mandril 51
-```
+- “Six hundred twenty pounds, eight thousand five hundred fifty feet.”
+- “Seiscientas veinte libras, ocho mil quinientos cincuenta pies.”
+- “Current weight seven point two five, speed one fifty, target six point three.”
+- “Peso actual siete punto dos cinco, velocidad ciento cincuenta, objetivo seis punto tres.”
+- “Mandrel fifty one.”
+- “Mandril cuarenta y ocho.”
 
-### Roll length
+The bot displays what it understood before returning the result.
 
-```text
-/ft 5.71 620
-FT 5.71 620
-¿Cuántos pies con BW 5.71 y peso 620?
-How many feet with BW 5.71 and weight 620?
-```
+## Railway deployment
 
-### S-Wrap
+1. Upload all files in this project to the GitHub repository.
+2. Keep the existing Railway variable named `BOT_TOKEN`.
+3. Railway detects the `Dockerfile`, installs FFmpeg, and downloads the official small English and Spanish Vosk models during the build.
+4. Wait for **Deployment successful**.
+5. Test text first, then send a Telegram voice note.
 
-```text
-/swrap 7.25 150 6.3
-Mi peso actual es 7.25 y mi velocidad es 150; quiero cambiar a 6.3
-Current weight is 7.25, speed is 150, and target weight is 6.3
-```
+The first Docker build is slower because it downloads approximately 80 MB of language models.
 
-Result:
+## Commands
 
-```text
-Sube el S-Wrap a 172.6
-```
+- `/start`
+- `/help`
+- `/bw 620 8550`
+- `/ft 5.71 620`
+- `/swrap 7.25 150 6.3`
+- `/mandrel 48`
+- `/mandrel 51`
+- `/language auto`
+- `/language es`
+- `/language en`
 
-### Change the default mandrel
+`/language auto` tries both language models and chooses the best result. Selecting `es` or `en` is faster and uses less memory.
 
-```text
-48
-51
-/mandrel 48
-/mandrel 51
-Use 51 mandrel
-Usa mandril 51
-```
+## Privacy and cost
 
-## Formulae
-
-The bot uses the same Basis Weight formula as the BW Tools web app:
-
-```text
-BW = (weight_lb × 453.59237) ÷ ((length_ft × 12 × mandrel_in) ÷ 100)
-```
-
-Reverse length calculation:
-
-```text
-FT = (weight_lb × 453.59237 × 100) ÷ (BW × 12 × mandrel_in)
-```
-
-S-Wrap calculation:
-
-```text
-new_speed = current_weight × current_speed ÷ target_weight
-```
-
-## Deploy to Railway from GitHub
-
-1. Create a new GitHub repository named `BW-Telegram-Bot`.
-2. Upload every file from this project.
-3. In Railway, select **New Project → Deploy from GitHub repo**.
-4. Choose `BW-Telegram-Bot`.
-5. Open the Railway service and select **Variables**.
-6. Add:
-
-```text
-BOT_TOKEN=your_private_token_from_BotFather
-```
-
-7. Deploy the staged changes.
-8. Open **Deployments → View Logs**. You should see:
-
-```text
-BW Assistant is starting.
-```
-
-Do not put the real token in GitHub. Railway provides variables to the running application as environment variables.
-
-Railway should detect the Python project automatically. This repository also includes `railway.json` and a `Procfile`; the intended start command is:
-
-```text
-python main.py
-```
-
-## Persistent mandrel settings on Railway
-
-The bot remembers user settings in `bot_data.pkl`. Railway storage may be replaced during redeployments unless you attach a persistent volume.
-
-For permanent storage:
-
-1. Add a Railway volume to the service.
-2. Mount it at:
-
-```text
-/data
-```
-
-3. Add this Railway variable:
-
-```text
-PERSISTENCE_FILE=/data/bot_data.pkl
-```
-
-Without a volume, the bot still works and remembers settings while the current deployment is running. The default always returns to 48 inches when no saved setting exists.
-
-## Security
-
-- Never upload your BotFather token to GitHub.
-- Never paste the token into screenshots or public chats.
-- If the token is exposed, use BotFather's `/revoke` command and create a replacement.
+Vosk performs speech recognition inside the Railway container. Voice notes are downloaded temporarily, converted, transcribed, and deleted when processing finishes. No paid speech API is used.
