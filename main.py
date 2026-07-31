@@ -33,6 +33,28 @@ MODEL_PATHS = {
 }
 MAX_VOICE_SECONDS = 30
 
+
+POISON_CONTROL_US = "1-800-222-1222"
+
+SDS_SECTIONS = {
+    1: ("Identification", "Identificación"),
+    2: ("Hazard(s) identification", "Identificación de peligros"),
+    3: ("Composition/information on ingredients", "Composición/información sobre los componentes"),
+    4: ("First-aid measures", "Medidas de primeros auxilios"),
+    5: ("Fire-fighting measures", "Medidas contra incendios"),
+    6: ("Accidental release measures", "Medidas en caso de liberación accidental"),
+    7: ("Handling and storage", "Manipulación y almacenamiento"),
+    8: ("Exposure controls/personal protection", "Controles de exposición/protección personal"),
+    9: ("Physical and chemical properties", "Propiedades físicas y químicas"),
+    10: ("Stability and reactivity", "Estabilidad y reactividad"),
+    11: ("Toxicological information", "Información toxicológica"),
+    12: ("Ecological information", "Información ecológica"),
+    13: ("Disposal considerations", "Consideraciones sobre eliminación"),
+    14: ("Transport information", "Información sobre transporte"),
+    15: ("Regulatory information", "Información reglamentaria"),
+    16: ("Other information", "Otra información"),
+}
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
@@ -319,6 +341,246 @@ def result_with_sarcasm(
     return f"{result}\n\n_{line}_" if line else result
 
 
+
+def normalize_safety_text(text: str) -> str:
+    lowered = text.lower()
+    replacements = {
+        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ü": "u", "ñ": "n",
+    }
+    for old, new in replacements.items():
+        lowered = lowered.replace(old, new)
+    return lowered
+
+
+def detect_safety_intent(text: str) -> Optional[str]:
+    """Detect urgent chemical exposure or SDS questions in English or Spanish."""
+    t = normalize_safety_text(text)
+
+    if re.search(r"\b(sds|safety data sheet|hoja de seguridad|hoja de datos de seguridad)\b", t):
+        return "sds"
+
+    chemical_terms = (
+        "chemical", "quimico", "bleach", "cloro", "chlorine", "acid", "acido",
+        "solvent", "solvente", "acetone", "acetona", "ammonia", "amoniaco",
+        "caustic", "caustico", "cleaner", "limpiador", "degreaser", "desengrasante",
+        "paint", "pintura", "resin", "resina", "adhesive", "pegamento",
+    )
+    exposure_terms = (
+        "me cayo", "me eche", "me salpico", "entro en", "en el ojo", "en mis ojos",
+        "en la piel", "en mi mano", "lo respire", "respire", "inhale", "inhaled",
+        "swallowed", "ingeri", "trague", "bebí", "bebi", "derrame", "spill",
+        "splashed", "got in my eye", "in my eyes", "on my skin", "can\'t breathe",
+        "cannot breathe", "no puedo respirar", "me queme", "burned me",
+    )
+    if any(term in t for term in exposure_terms) and any(term in t for term in chemical_terms):
+        if re.search(r"\b(ojo|ojos|eye|eyes)\b", t): return "eye"
+        if re.search(r"\b(respire|inhale|inhaled|breath|respirar|pulmon|lungs?)\b", t): return "inhalation"
+        if re.search(r"\b(piel|mano|brazo|skin|hand|arm)\b", t): return "skin"
+        if re.search(r"\b(trague|ingeri|bebi|swallowed|drank|ingested)\b", t): return "ingestion"
+        if re.search(r"\b(derrame|spill|leak|fuga)\b", t): return "spill"
+        return "general_exposure"
+
+    if re.search(r"\b(no puedo respirar|cannot breathe|can\'t breathe|difficulty breathing|dificultad para respirar)\b", t):
+        return "inhalation"
+    return None
+
+
+def safety_product_name(text: str) -> str:
+    t = normalize_safety_text(text)
+    products = [
+        ("cloro", "cloro"), ("bleach", "bleach"), ("chlorine", "chlorine"),
+        ("acido muriatico", "ácido muriático"), ("muriatic acid", "muriatic acid"),
+        ("amoniaco", "amoníaco"), ("ammonia", "ammonia"),
+        ("acetona", "acetona"), ("acetone", "acetone"),
+        ("solvente", "solvente"), ("solvent", "solvent"),
+        ("caustico", "cáustico"), ("caustic", "caustic chemical"),
+    ]
+    for key, label in products:
+        if key in t:
+            return label
+    return "el químico" if any(c in t for c in ("quimico", "chemical")) else "el producto"
+
+
+def safety_response(intent: str, language: str, text: str = "") -> str:
+    """Offline, conservative first-aid guidance. Serious tone only."""
+    product = safety_product_name(text)
+    if language == "es":
+        if intent == "eye":
+            return (
+                "🚨 *POSIBLE EXPOSICIÓN QUÍMICA EN LOS OJOS*\n\n"
+                "1. Ve inmediatamente al lavaojos o usa abundante agua limpia.\n"
+                "2. Enjuaga continuamente durante *al menos 15 minutos*, manteniendo los párpados abiertos.\n"
+                "3. Retira los lentes de contacto si salen fácilmente; no retrases el enjuague para quitarlos.\n"
+                "4. *No te frotes los ojos* y no pongas gotas, neutralizantes ni otros químicos.\n"
+                "5. Pide ayuda al supervisor/equipo de emergencia y consulta la *Sección 4 de la SDS* del producto.\n\n"
+                "⚠️ Busca atención médica inmediata si hay dolor fuerte, visión borrosa, quemadura, sensibilidad a la luz o si el producto es corrosivo. "
+                f"En EE. UU., Poison Control: *{POISON_CONTROL_US}*. Si hay pérdida de visión o una emergencia grave, llama al *911*."
+            )
+        if intent == "inhalation":
+            return (
+                "🚨 *POSIBLE INHALACIÓN DE UN QUÍMICO*\n\n"
+                "1. Aléjate del área y ve a aire fresco *sin ponerte en riesgo*.\n"
+                "2. No regreses al área hasta que personal autorizado indique que es seguro.\n"
+                "3. Afloja ropa ajustada y permanece en reposo.\n"
+                "4. Avisa inmediatamente al supervisor/equipo de emergencia y revisa la *Sección 4 de la SDS*.\n\n"
+                "⚠️ Si tienes dificultad para respirar, opresión en el pecho, confusión, desmayo o labios azulados, llama al *911* ahora. "
+                f"Poison Control en EE. UU.: *{POISON_CONTROL_US}*."
+            )
+        if intent == "skin":
+            return (
+                "🚨 *POSIBLE EXPOSICIÓN QUÍMICA EN LA PIEL*\n\n"
+                "1. Retira de inmediato la ropa, guantes o joyería contaminados.\n"
+                "2. Enjuaga la piel con abundante agua durante *al menos 15 minutos*.\n"
+                "3. No uses neutralizantes ni mezcles otros productos sobre la piel.\n"
+                "4. Avisa al supervisor/equipo de emergencia y consulta la *Sección 4 de la SDS*.\n\n"
+                "⚠️ Busca atención médica si hay quemadura, dolor, ampollas, entumecimiento o si el químico es corrosivo."
+            )
+        if intent == "ingestion":
+            return (
+                "🚨 *POSIBLE INGESTIÓN DE UN QUÍMICO*\n\n"
+                "1. Enjuaga la boca con agua.\n"
+                "2. *No provoques el vómito* salvo que Poison Control o la SDS lo indiquen expresamente.\n"
+                "3. No des comida, bebida ni medicamentos a una persona inconsciente.\n"
+                "4. Conserva la etiqueta o SDS del producto y llama de inmediato a Poison Control.\n\n"
+                f"En EE. UU.: *{POISON_CONTROL_US}*. Si hay dificultad para respirar, convulsiones, desmayo o síntomas graves, llama al *911*."
+            )
+        if intent == "spill":
+            return (
+                "🚨 *DERRAME QUÍMICO DETECTADO*\n\n"
+                "1. Aléjate y evita tocar o respirar el producto.\n"
+                "2. Avisa al supervisor/equipo de respuesta a derrames.\n"
+                "3. Aísla el área si puedes hacerlo sin riesgo.\n"
+                "4. No limpies el derrame sin el PPE y procedimiento correctos.\n"
+                "5. Consulta la *Sección 6 de la SDS* para contención y limpieza, y la *Sección 8* para PPE.\n\n"
+                "⚠️ Si hay vapores fuertes, fuego, reacción, lesión o riesgo de explosión, evacúa y llama al *911*."
+            )
+        return (
+            "🚨 *POSIBLE EXPOSICIÓN QUÍMICA*\n\n"
+            "Aléjate de la fuente, avisa al supervisor/equipo de emergencia y consulta inmediatamente la SDS del producto. "
+            "Indícame si fue en los ojos, piel, por inhalación o ingestión para darte los primeros pasos correctos."
+        )
+
+    if intent == "eye":
+        return (
+            "🚨 *POSSIBLE CHEMICAL EYE EXPOSURE*\n\n"
+            "1. Go immediately to an eyewash station or use plenty of clean water.\n"
+            "2. Flush continuously for *at least 15 minutes*, holding the eyelids open.\n"
+            "3. Remove contact lenses if they come out easily; do not delay flushing to remove them.\n"
+            "4. *Do not rub the eyes* and do not add drops, neutralizers, or other chemicals.\n"
+            "5. Notify a supervisor/emergency team and check *SDS Section 4*.\n\n"
+            "⚠️ Get immediate medical attention for severe pain, blurred vision, burns, light sensitivity, or a corrosive product. "
+            f"U.S. Poison Control: *{POISON_CONTROL_US}*. Call *911* for vision loss or a severe emergency."
+        )
+    if intent == "inhalation":
+        return (
+            "🚨 *POSSIBLE CHEMICAL INHALATION*\n\n"
+            "1. Move away from the area and get to fresh air *without putting yourself at risk*.\n"
+            "2. Do not re-enter until authorized personnel say it is safe.\n"
+            "3. Loosen tight clothing and rest.\n"
+            "4. Notify a supervisor/emergency team and check *SDS Section 4*.\n\n"
+            "⚠️ Call *911* now for trouble breathing, chest tightness, confusion, fainting, or blue lips. "
+            f"U.S. Poison Control: *{POISON_CONTROL_US}*."
+        )
+    if intent == "skin":
+        return (
+            "🚨 *POSSIBLE CHEMICAL SKIN EXPOSURE*\n\n"
+            "1. Immediately remove contaminated clothing, gloves, and jewelry.\n"
+            "2. Flush the skin with plenty of water for *at least 15 minutes*.\n"
+            "3. Do not apply neutralizers or mix other products on the skin.\n"
+            "4. Notify a supervisor/emergency team and check *SDS Section 4*.\n\n"
+            "⚠️ Get medical attention for burns, severe pain, blisters, numbness, or a corrosive chemical."
+        )
+    if intent == "ingestion":
+        return (
+            "🚨 *POSSIBLE CHEMICAL INGESTION*\n\n"
+            "1. Rinse the mouth with water.\n"
+            "2. *Do not induce vomiting* unless Poison Control or the SDS specifically tells you to.\n"
+            "3. Do not give food, drink, or medicine to an unconscious person.\n"
+            "4. Keep the label/SDS and call Poison Control immediately.\n\n"
+            f"U.S. Poison Control: *{POISON_CONTROL_US}*. Call *911* for breathing problems, seizures, fainting, or severe symptoms."
+        )
+    if intent == "spill":
+        return (
+            "🚨 *CHEMICAL SPILL DETECTED*\n\n"
+            "1. Move away and avoid touching or breathing the product.\n"
+            "2. Notify the supervisor/spill-response team.\n"
+            "3. Isolate the area if you can do so safely.\n"
+            "4. Do not clean it without the required PPE and procedure.\n"
+            "5. Check *SDS Section 6* for containment/cleanup and *Section 8* for PPE.\n\n"
+            "⚠️ Evacuate and call *911* for strong vapors, fire, reaction, injury, or explosion risk."
+        )
+    return (
+        "🚨 *POSSIBLE CHEMICAL EXPOSURE*\n\n"
+        "Move away from the source, notify the supervisor/emergency team, and check the product SDS immediately. "
+        "Tell me whether it involved the eyes, skin, inhalation, or ingestion for the correct first steps."
+    )
+
+
+def sds_help_text(language: str, section: Optional[int] = None) -> str:
+    if section in SDS_SECTIONS:
+        en, es = SDS_SECTIONS[section]
+        title = es if language == "es" else en
+        details_es = {
+            1: "Nombre del producto, fabricante, uso recomendado y teléfono de emergencia.",
+            2: "Clasificación del peligro, palabra de advertencia, pictogramas y declaraciones preventivas.",
+            3: "Ingredientes peligrosos y concentraciones relevantes.",
+            4: "Primeros auxilios por ojos, piel, inhalación e ingestión.",
+            5: "Medios de extinción, peligros del incendio y protección para bomberos.",
+            6: "Precauciones, contención y limpieza de derrames.",
+            7: "Manipulación segura, almacenamiento e incompatibilidades.",
+            8: "Límites de exposición, ventilación, controles y PPE/EPP.",
+            9: "Estado físico, olor, pH, punto de inflamación y otras propiedades.",
+            10: "Reactividad, estabilidad, materiales incompatibles y productos de descomposición.",
+            11: "Rutas de exposición, síntomas y efectos toxicológicos.",
+            12: "Efectos ambientales y ecotoxicidad.",
+            13: "Manejo y eliminación de residuos y envases contaminados.",
+            14: "Clasificación e información para transporte.",
+            15: "Regulaciones aplicables al producto.",
+            16: "Fecha de preparación/revisión y otra información.",
+        }
+        details_en = {
+            1: "Product name, manufacturer, recommended use, and emergency phone number.",
+            2: "Hazard classification, signal word, pictograms, and precautionary statements.",
+            3: "Hazardous ingredients and relevant concentrations.",
+            4: "First aid for eye, skin, inhalation, and ingestion exposure.",
+            5: "Extinguishing media, fire hazards, and firefighter protection.",
+            6: "Precautions, containment, and spill-cleanup methods.",
+            7: "Safe handling, storage, and incompatibilities.",
+            8: "Exposure limits, ventilation, controls, and PPE.",
+            9: "Physical state, odor, pH, flash point, and other properties.",
+            10: "Reactivity, stability, incompatible materials, and decomposition products.",
+            11: "Exposure routes, symptoms, and toxicological effects.",
+            12: "Environmental effects and ecotoxicity.",
+            13: "Waste and contaminated-container disposal considerations.",
+            14: "Transport classification and information.",
+            15: "Regulations that apply to the product.",
+            16: "Preparation/revision date and other information.",
+        }
+        detail = details_es[section] if language == "es" else details_en[section]
+        return f"📄 *SDS Sección {section} — {title}*\n\n{detail}"
+
+    lines = []
+    for number, (en, es) in SDS_SECTIONS.items():
+        lines.append(f"{number}. {es if language == 'es' else en}")
+    header = "📄 *Las 16 secciones de una SDS*" if language == "es" else "📄 *The 16 SDS sections*"
+    footer = (
+        "\nUsa `/sds 4` para primeros auxilios o `/sds 8` para PPE/EPP."
+        if language == "es" else
+        "\nUse `/sds 4` for first aid or `/sds 8` for PPE."
+    )
+    return header + "\n\n" + "\n".join(lines) + footer
+
+
+async def sds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    language = get_response_language(update, context)
+    text = update.effective_message.text or ""
+    numbers = extract_numbers(text)
+    section = int(numbers[0]) if numbers and numbers[0].is_integer() else None
+    await update.effective_message.reply_text(
+        sds_help_text(language, section), parse_mode="Markdown"
+    )
+
+
 def calculate_bw(weight_lb: float, length_ft: float, mandrel_in: float) -> float:
     return (weight_lb * 453.59237) / ((length_ft * 12 * mandrel_in) / 100)
 
@@ -560,7 +822,7 @@ def help_text(language: str, mandrel: float) -> str:
     voice_lang = "Auto"
     if language == "es":
         return (
-            "🤖 *Viejito — BW Assistant V2.3*\n\n"
+            "🤖 *Viejito — BW Assistant V2.4*\n\n"
             "✍️ Escribe o 🎤 manda una nota de voz.\n"
             f"Mandril actual: *{int(mandrel)}”*\n\n"
             "*BW:* `620 8550`\n"
@@ -570,10 +832,11 @@ def help_text(language: str, mandrel: float) -> str:
             "Idioma automático: sigue la configuración de Telegram.\n"
             "Cambiar: `/language auto`, `/language es`, `/language en`\n"
             "Sarcasmo: `/sarcasm heavy`, `/sarcasm light`, `/sarcasm off`\n"
-            "Comandos: /bw /ft /swrap /mandrel /language /sarcasm /help"
+            "Seguridad química/SDS: describe la exposición o usa `/sds`\n"
+            "Comandos: /bw /ft /swrap /mandrel /sds /language /sarcasm /help"
         )
     return (
-        "🤖 *Viejito — BW Assistant V2.3*\n\n"
+        "🤖 *Viejito — BW Assistant V2.4*\n\n"
         "✍️ Type or 🎤 send a voice note.\n"
         f"Current mandrel: *{int(mandrel)}”*\n\n"
         "*BW:* `620 8550`\n"
@@ -583,7 +846,8 @@ def help_text(language: str, mandrel: float) -> str:
         "Automatic language: follows your Telegram settings.\n"
         "Change: `/language auto`, `/language es`, `/language en`\n"
         "Sarcasm: `/sarcasm heavy`, `/sarcasm light`, `/sarcasm off`\n"
-        "Commands: /bw /ft /swrap /mandrel /language /sarcasm /help"
+        "Chemical safety/SDS: describe the exposure or use `/sds`\n"
+        "Commands: /bw /ft /swrap /mandrel /sds /language /sarcasm /help"
     )
 
 
@@ -753,6 +1017,19 @@ async def process_text(
 ) -> None:
     text = text.strip()
     language = get_response_language(update, context)
+    safety_intent = detect_safety_intent(text)
+    if safety_intent and safety_intent != "sds":
+        await update.effective_message.reply_text(
+            safety_response(safety_intent, language, text), parse_mode="Markdown"
+        )
+        return
+    if safety_intent == "sds":
+        numbers = extract_numbers(text)
+        section = int(numbers[0]) if numbers and numbers[0].is_integer() else None
+        await update.effective_message.reply_text(
+            sds_help_text(language, section), parse_mode="Markdown"
+        )
+        return
     sarcasm_choice = sarcasm_request(text)
     if sarcasm_choice is not None:
         original_text = update.effective_message.text
@@ -915,12 +1192,13 @@ async def post_init(application: Application) -> None:
         BotCommand("ft", "Calculate feet"),
         BotCommand("swrap", "Calculate S-Wrap"),
         BotCommand("mandrel", "Set 48 or 51 inch mandrel"),
+        BotCommand("sds", "SDS sections and chemical safety"),
         BotCommand("language", "Voice language: auto, en, es"),
         BotCommand("sarcasm", "Sarcasm: heavy, light, off"),
         BotCommand("help", "Examples / Ejemplos"),
     ]
     await application.bot.set_my_commands(commands)
-    logger.info("Viejito V2.3 started. Voice models: %s", MODEL_PATHS)
+    logger.info("Viejito V2.4 started. Voice models: %s", MODEL_PATHS)
 
 
 def main() -> None:
@@ -941,6 +1219,7 @@ def main() -> None:
     application.add_handler(CommandHandler("ft", ft_command))
     application.add_handler(CommandHandler("swrap", swrap_command))
     application.add_handler(CommandHandler("mandrel", mandrel_command))
+    application.add_handler(CommandHandler("sds", sds_command))
     application.add_handler(CommandHandler("language", language_command))
     application.add_handler(CommandHandler("sarcasm", sarcasm_command))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
