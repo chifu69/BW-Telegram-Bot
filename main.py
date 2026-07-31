@@ -3,6 +3,7 @@ import gc
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import tempfile
@@ -48,6 +49,24 @@ def detect_language(text: str) -> str:
         "usar", "usa", "nuevo", "nueva", "objetivo", "deseado",
     )
     return "es" if any(word in lowered for word in spanish_words) else "en"
+
+
+def telegram_language(update: Update) -> str:
+    """Use the language Telegram reports from the user's app/account."""
+    user = update.effective_user
+    code = (user.language_code or "en").lower() if user else "en"
+    return "es" if code.startswith("es") else "en"
+
+
+def get_response_language(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> str:
+    """Per-user reply language. Auto follows the user's Telegram language."""
+    preference = str(context.user_data.get("response_language", "auto")).lower()
+    if preference in {"es", "en"}:
+        return preference
+    return telegram_language(update)
 
 
 def extract_numbers(text: str) -> list[float]:
@@ -109,45 +128,194 @@ def sarcasm_request(text: str) -> Optional[str]:
     return None
 
 
-def sarcasm_line(kind: str, language: str, level: str) -> str:
+def sarcasm_line(
+    kind: str,
+    language: str,
+    level: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> str:
+    """Choose varied sarcasm and avoid repeating the previous line."""
     if level == "off":
         return ""
+
     lines = {
         "es": {
             "heavy": {
-                "bw": "Ahí tienes el BW. La máquina hizo su parte; ahora intenta tú no arruinarla.",
-                "ft": "Ahí están tus pies. Tranquilo, contar hasta ese número no era requisito para el puesto.",
-                "swrap": "Ese es el nuevo S-Wrap. Ajustarlo sigue siendo trabajo tuyo, campeón.",
-                "mandrel": "Mandril cambiado. Milagrosamente sobrevivimos a una decisión de dos opciones.",
+                "bw": [
+                    "Ahí tienes el BW. La máquina hizo su parte; ahora intenta tú no arruinarla.",
+                    "BW calculado. Increíblemente, dos números sí fueron suficientes.",
+                    "Listo el BW. Otro misterio industrial resuelto sin llamar a mantenimiento.",
+                    "Ahí está el BW. Puedes fingir que lo calculaste mentalmente.",
+                    "BW terminado. Respira, la aritmética ya no puede hacerte daño.",
+                    "El BW es ese. Hasta la calculadora parece decepcionada de que fuera tan fácil.",
+                    "Resultado listo. La máquina coopera más cuando alguien trae los números correctos.",
+                    "BW calculado. Por suerte, el bot sí vino preparado para trabajar.",
+                    "Ahí tienes el dato real. El resto del turno sigue siendo problema tuyo.",
+                    "BW listo. No fue magia; solo matemáticas haciendo horas extra por ti.",
+                    "Resultado correcto. Intenta conservar esta racha de decisiones acertadas.",
+                    "BW entregado. Puedes volver a mirar la máquina como si supieras exactamente qué pasa.",
+                ],
+                "ft": [
+                    "Ahí están tus pies. Tranquilo, contar hasta ese número no era requisito para el puesto.",
+                    "Pies calculados. La cinta métrica puede tomarse el resto del día libre.",
+                    "Listo el metraje. Sorprendentemente, no hubo que caminarlo para medirlo.",
+                    "Ahí tienes los pies. Procura no gastarlos todos de una vez.",
+                    "Resultado listo. Otra vez las matemáticas evitando una reunión innecesaria.",
+                    "Pies calculados. Puedes decir que fue experiencia; yo guardaré el secreto.",
+                    "Ese es el metraje real. Lo demás son opiniones de operador.",
+                    "Listo. La máquina no habló, pero sus números sí.",
+                    "Metraje entregado. Hasta el rollo parecía cansado de esperar.",
+                    "Ahí están tus pies. Ninguno tuvo que sufrir durante el cálculo.",
+                ],
+                "swrap": [
+                    "Ese es el nuevo S-Wrap. Ajustarlo sigue siendo trabajo tuyo, campeón.",
+                    "S-Wrap listo. Ahora viene la parte donde finges que siempre supiste el ajuste.",
+                    "Nuevo S-Wrap calculado. La máquina espera; intenta no decepcionarla.",
+                    "Ahí está el ajuste. Girar el control correctamente no viene incluido.",
+                    "Resultado listo. El bot hizo las cuentas; tú haz la parte con botones.",
+                    "S-Wrap calculado. Otra crisis evitada con tres números y un poco de dignidad.",
+                    "Ese es el valor correcto. No lo mejores con creatividad.",
+                    "Nuevo S-Wrap listo. Por favor, úsalo antes de culpar al material.",
+                    "Ajuste calculado. La máquina acaba de quedarse sin excusas; tú también.",
+                    "Ahí tienes el S-Wrap. Léelo dos veces antes de tocar algo caro.",
+                ],
+                "mandrel": [
+                    "Mandril cambiado. Milagrosamente sobrevivimos a una decisión de dos opciones.",
+                    "Mandril actualizado. Elegir entre 48 y 51 fue una auténtica prueba de liderazgo.",
+                    "Listo, mandril cambiado. La operación puede continuar con normalidad aparente.",
+                    "Configuración guardada. Otro botón conquistado.",
+                    "Mandril actualizado. Nadie resultó herido durante la selección.",
+                    "Cambio hecho. Dos opciones y aun así lo logramos.",
+                ],
             },
             "light": {
-                "bw": "Listo, el BW apareció sin necesidad de sacrificar una calculadora.",
-                "ft": "Aquí están los pies. Fácil cuando alguien más hace las cuentas, ¿verdad?",
-                "swrap": "Nuevo S-Wrap listo. Ahora solo falta que la máquina coopere.",
-                "mandrel": "Mandril cambiado. Misión cumplida.",
+                "bw": [
+                    "Listo, el BW apareció sin necesidad de sacrificar una calculadora.",
+                    "BW listo. Las matemáticas cooperaron esta vez.",
+                    "Resultado preparado. Hasta el rollo parece más tranquilo.",
+                    "BW calculado; trabajo en equipo entre tú y los números.",
+                    "Ahí está el BW, limpio y sin drama.",
+                ],
+                "ft": [
+                    "Aquí están los pies. Fácil cuando alguien más hace las cuentas, ¿verdad?",
+                    "Metraje listo. La cinta métrica puede descansar.",
+                    "Pies calculados, sin caminar ninguno.",
+                    "Resultado listo. Eso fue bastante civilizado.",
+                    "Ahí tienes el metraje correcto.",
+                ],
+                "swrap": [
+                    "Nuevo S-Wrap listo. Ahora solo falta que la máquina coopere.",
+                    "Ajuste calculado. Tu turno con los controles.",
+                    "S-Wrap listo y sin drama.",
+                    "Resultado preparado. La máquina está esperando.",
+                    "Nuevo valor listo para usar.",
+                ],
+                "mandrel": [
+                    "Mandril cambiado. Misión cumplida.",
+                    "Configuración actualizada.",
+                    "Mandril listo.",
+                    "Cambio guardado correctamente.",
+                ],
             },
         },
         "en": {
             "heavy": {
-                "bw": "There’s your BW. The machine did its part; try not to ruin yours.",
-                "ft": "There are your feet. Relax, counting that high was never part of the job description.",
-                "swrap": "That’s the new S-Wrap. Adjusting it is still your job, champion.",
-                "mandrel": "Mandrel changed. Somehow we survived a decision with only two options.",
+                "bw": [
+                    "There’s your BW. The machine did its part; try not to ruin yours.",
+                    "BW calculated. Apparently two numbers really can solve a crisis.",
+                    "BW is ready. Another industrial mystery solved without calling maintenance.",
+                    "There’s the BW. Feel free to pretend you did it in your head.",
+                    "BW complete. Relax—the arithmetic can’t hurt you anymore.",
+                    "That’s the BW. Even the calculator looks disappointed it was this easy.",
+                    "Result ready. Machines cooperate better when somebody brings the right numbers.",
+                    "BW calculated. Good thing the bot showed up ready to work.",
+                    "There’s the real number. The rest of the shift is still your problem.",
+                    "BW ready. Not magic—just math working overtime for you.",
+                    "Correct result delivered. Try to keep this streak of good decisions alive.",
+                    "BW delivered. You may now stare at the machine like you know exactly what’s happening.",
+                ],
+                "ft": [
+                    "There are your feet. Relax, counting that high was never part of the job description.",
+                    "Feet calculated. The tape measure can take the rest of the day off.",
+                    "Length ready. Amazingly, nobody had to walk it to measure it.",
+                    "There are your feet. Try not to spend them all in one place.",
+                    "Result ready. Math prevents another unnecessary meeting.",
+                    "Feet calculated. You can call it experience; I’ll keep the secret.",
+                    "That’s the real length. Everything else is operator folklore.",
+                    "Done. The machine didn’t talk, but its numbers did.",
+                    "Length delivered. Even the roll was getting tired of waiting.",
+                    "There are your feet. None were harmed during the calculation.",
+                ],
+                "swrap": [
+                    "That’s the new S-Wrap. Adjusting it is still your job, champion.",
+                    "S-Wrap ready. Now comes the part where you pretend you knew the setting all along.",
+                    "New S-Wrap calculated. The machine is waiting—try not to disappoint it.",
+                    "There’s the setting. Turning the control correctly is not included.",
+                    "Result ready. The bot did the math; you handle the buttons.",
+                    "S-Wrap calculated. Another crisis avoided with three numbers and minimal dignity.",
+                    "That’s the correct value. Please don’t improve it with creativity.",
+                    "New S-Wrap ready. Use it before blaming the material.",
+                    "Setting calculated. The machine is out of excuses, and so are you.",
+                    "There’s your S-Wrap. Read it twice before touching anything expensive.",
+                ],
+                "mandrel": [
+                    "Mandrel changed. Somehow we survived a decision with only two options.",
+                    "Mandrel updated. Choosing between 48 and 51 was true leadership.",
+                    "Done. The operation may continue with its usual appearance of control.",
+                    "Setting saved. Another button conquered.",
+                    "Mandrel updated. Nobody was injured during the selection.",
+                    "Change complete. Two choices, and we still made it.",
+                ],
             },
             "light": {
-                "bw": "BW is ready—no calculator sacrifice required.",
-                "ft": "Here are the feet. Math is easier when somebody else does it, huh?",
-                "swrap": "New S-Wrap ready. Now we just need the machine to cooperate.",
-                "mandrel": "Mandrel changed. Mission accomplished.",
+                "bw": [
+                    "BW is ready—no calculator sacrifice required.",
+                    "BW ready. The math cooperated this time.",
+                    "Result prepared. Even the roll looks calmer.",
+                    "BW calculated—nice teamwork between you and the numbers.",
+                    "There’s your BW, clean and drama-free.",
+                ],
+                "ft": [
+                    "Here are the feet. Math is easier when somebody else does it, huh?",
+                    "Length ready. The tape measure can rest.",
+                    "Feet calculated without walking a single one.",
+                    "Result ready. That was pleasantly civilized.",
+                    "There’s the correct length.",
+                ],
+                "swrap": [
+                    "New S-Wrap ready. Now we just need the machine to cooperate.",
+                    "Setting calculated. Your turn with the controls.",
+                    "S-Wrap ready, no drama required.",
+                    "Result prepared. The machine is waiting.",
+                    "New value ready to use.",
+                ],
+                "mandrel": [
+                    "Mandrel changed. Mission accomplished.",
+                    "Setting updated.",
+                    "Mandrel ready.",
+                    "Change saved successfully.",
+                ],
             },
         },
     }
-    return lines[language][level][kind]
+
+    choices = lines[language][level][kind]
+    key = f"last_sarcasm_{language}_{level}_{kind}"
+    previous = context.user_data.get(key)
+    available = [line for line in choices if line != previous] or choices
+    selected = random.choice(available)
+    context.user_data[key] = selected
+    return selected
 
 
-def result_with_sarcasm(result: str, kind: str, language: str, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Always place the factual result first, then optional sarcasm."""
-    line = sarcasm_line(kind, language, get_sarcasm_level(context))
+def result_with_sarcasm(
+    result: str,
+    kind: str,
+    language: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> str:
+    """Always place the factual result first, then optional varied sarcasm."""
+    line = sarcasm_line(kind, language, get_sarcasm_level(context), context)
     return f"{result}\n\n_{line}_" if line else result
 
 
@@ -392,33 +560,35 @@ def help_text(language: str, mandrel: float) -> str:
     voice_lang = "Auto"
     if language == "es":
         return (
-            "🤖 *Viejito — BW Assistant V2.2*\n\n"
+            "🤖 *Viejito — BW Assistant V2.3*\n\n"
             "✍️ Escribe o 🎤 manda una nota de voz.\n"
             f"Mandril actual: *{int(mandrel)}”*\n\n"
             "*BW:* `620 8550`\n"
             "*FT:* `FT 5.71 620`\n"
             "*S-Wrap:* `7.25 150 6.3` o dilo con palabras\n"
             "*Mandril:* `48` o `51`\n\n"
-            "Voz: `/language auto`, `/language es`, `/language en`\n"
+            "Idioma automático: sigue la configuración de Telegram.\n"
+            "Cambiar: `/language auto`, `/language es`, `/language en`\n"
             "Sarcasmo: `/sarcasm heavy`, `/sarcasm light`, `/sarcasm off`\n"
             "Comandos: /bw /ft /swrap /mandrel /language /sarcasm /help"
         )
     return (
-        "🤖 *Viejito — BW Assistant V2.2*\n\n"
+        "🤖 *Viejito — BW Assistant V2.3*\n\n"
         "✍️ Type or 🎤 send a voice note.\n"
         f"Current mandrel: *{int(mandrel)}”*\n\n"
         "*BW:* `620 8550`\n"
         "*FT:* `FT 5.71 620`\n"
         "*S-Wrap:* `7.25 150 6.3` or say it naturally\n"
         "*Mandrel:* `48` or `51`\n\n"
-        "Voice: `/language auto`, `/language es`, `/language en`\n"
+        "Automatic language: follows your Telegram settings.\n"
+        "Change: `/language auto`, `/language es`, `/language en`\n"
         "Sarcasm: `/sarcasm heavy`, `/sarcasm light`, `/sarcasm off`\n"
         "Commands: /bw /ft /swrap /mandrel /language /sarcasm /help"
     )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    language = detect_language(update.effective_message.text or "")
+    language = get_response_language(update, context)
     await update.effective_message.reply_text(help_text(language, get_mandrel(context)), parse_mode="Markdown")
 
 
@@ -427,22 +597,49 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set reply and voice language, or follow Telegram automatically."""
     text = (update.effective_message.text or "").lower()
     choice = next((x for x in ("auto", "en", "es") if re.search(rf"\b{x}\b", text)), None)
+    current_language = get_response_language(update, context)
+
     if choice:
         context.user_data["voice_language"] = choice
-        labels = {"auto": "automático / automatic", "en": "English", "es": "Español"}
-        await update.effective_message.reply_text(f"🎤 Voice language: {labels[choice]}")
-    else:
-        current = get_voice_language(context)
+        context.user_data["response_language"] = choice
+
+        if choice == "auto":
+            resolved = telegram_language(update)
+            message = (
+                f"✅ Idioma automático activado. Responderé en {'español' if resolved == 'es' else 'inglés'} "
+                "según la configuración de Telegram."
+                if resolved == "es"
+                else f"✅ Automatic language enabled. I’ll reply in {'Spanish' if resolved == 'es' else 'English'} "
+                     "based on your Telegram settings."
+            )
+        elif choice == "es":
+            message = "✅ Idioma configurado en español para texto y voz."
+        else:
+            message = "✅ Language set to English for text and voice."
+
+        await update.effective_message.reply_text(message)
+        return
+
+    preference = str(context.user_data.get("response_language", "auto")).lower()
+    resolved = get_response_language(update, context)
+    if resolved == "es":
         await update.effective_message.reply_text(
-            f"Current voice language: {current}\nUse /language auto, /language es, or /language en"
+            f"Idioma actual: {preference} (respondiendo en español).\n"
+            "Usa /language auto, /language es o /language en."
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"Current language: {preference} (replying in English).\n"
+            "Use /language auto, /language es, or /language en."
         )
 
 
 async def sarcasm_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.effective_message.text or ""
-    language = detect_language(text)
+    language = get_response_language(update, context)
     choice = sarcasm_request(text)
     if choice in {"heavy", "light", "off"}:
         set_sarcasm_level(context, choice)
@@ -470,7 +667,7 @@ async def sarcasm_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def mandrel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.effective_message.text or ""
-    language = detect_language(text)
+    language = get_response_language(update, context)
     numbers = extract_numbers(text)
     if numbers and numbers[0] in VALID_MANDRELS:
         mandrel = numbers[0]
@@ -490,7 +687,7 @@ async def mandrel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def bw_command(update: Update, context: ContextTypes.DEFAULT_TYPE, source_text: Optional[str] = None) -> None:
     text = source_text if source_text is not None else (update.effective_message.text or "")
-    language = detect_language(text)
+    language = get_response_language(update, context)
     explicit = explicit_mandrel(text)
     numbers = remove_explicit_mandrel_number(text, explicit)
     if len(numbers) < 2:
@@ -510,7 +707,7 @@ async def bw_command(update: Update, context: ContextTypes.DEFAULT_TYPE, source_
 
 async def ft_command(update: Update, context: ContextTypes.DEFAULT_TYPE, source_text: Optional[str] = None) -> None:
     text = source_text if source_text is not None else (update.effective_message.text or "")
-    language = detect_language(text)
+    language = get_response_language(update, context)
     explicit = explicit_mandrel(text)
     numbers = remove_explicit_mandrel_number(text, explicit)
     if len(numbers) < 2:
@@ -531,7 +728,7 @@ async def ft_command(update: Update, context: ContextTypes.DEFAULT_TYPE, source_
 
 async def swrap_command(update: Update, context: ContextTypes.DEFAULT_TYPE, source_text: Optional[str] = None) -> None:
     text = source_text if source_text is not None else (update.effective_message.text or "")
-    language = detect_language(text)
+    language = get_response_language(update, context)
     numbers = extract_numbers(text)
     if len(numbers) < 3:
         message = "Escribe: `/swrap peso velocidad objetivo`" if language == "es" else "Enter: `/swrap current-weight speed target-weight`"
@@ -555,7 +752,7 @@ async def process_text(
     from_voice: bool = False,
 ) -> None:
     text = text.strip()
-    language = detect_language(text)
+    language = get_response_language(update, context)
     sarcasm_choice = sarcasm_request(text)
     if sarcasm_choice is not None:
         original_text = update.effective_message.text
@@ -677,9 +874,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not message or not message.voice:
         return
     if message.voice.duration and message.voice.duration > MAX_VOICE_SECONDS:
-        await message.reply_text("Voice note is too long. Maximum: 30 seconds.")
+        await message.reply_text("La nota de voz es demasiado larga. Máximo: 30 segundos." if get_response_language(update, context) == "es" else "Voice note is too long. Maximum: 30 seconds.")
         return
-    status = await message.reply_text("🎤 Escuchando… / Listening…")
+    response_language = get_response_language(update, context)
+    status = await message.reply_text(
+        "🎤 Escuchando…" if response_language == "es" else "🎤 Listening…"
+    )
     try:
         telegram_file = await context.bot.get_file(message.voice.file_id)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -691,14 +891,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 transcribe_best, wav_path, get_voice_language(context)
             )
         if not text:
-            await status.edit_text("No pude entender el audio. / I couldn’t understand the audio.")
+            await status.edit_text("No pude entender el audio." if response_language == "es" else "I couldn’t understand the audio.")
             return
         await status.edit_text(f"🎤 {text}")
         await process_text(update, context, text, from_voice=True)
     except Exception:
         logger.exception("Voice processing failed")
         await status.edit_text(
-            "No pude procesar el audio. Inténtalo otra vez. / I couldn’t process the audio. Try again."
+            "No pude procesar el audio. Inténtalo otra vez."
+            if response_language == "es"
+            else "I couldn’t process the audio. Try again."
         )
 
 
@@ -718,7 +920,7 @@ async def post_init(application: Application) -> None:
         BotCommand("help", "Examples / Ejemplos"),
     ]
     await application.bot.set_my_commands(commands)
-    logger.info("Viejito V2.2 started. Voice models: %s", MODEL_PATHS)
+    logger.info("Viejito V2.3 started. Voice models: %s", MODEL_PATHS)
 
 
 def main() -> None:
