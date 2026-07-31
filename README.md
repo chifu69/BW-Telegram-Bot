@@ -1,56 +1,71 @@
-# Viejito — BW Assistant V2
+# Viejito Industrial Assistant V3 — Free Chemical Edition
 
-Telegram production calculator with **text and free offline voice recognition**.
+Telegram production assistant with:
 
-## Features
+- BW, FT, and S-Wrap calculations.
+- English/Spanish voice recognition with Vosk.
+- Automatic English/Spanish replies.
+- Per-user sarcasm controls for normal calculations.
+- Serious emergency mode for eye, skin, inhalation, ingestion, and spills.
+- Chemical search by common name or CAS through the free PubChem PUG REST service.
+- Label-photo OCR using free, offline Tesseract OCR.
+- SDS 16-section guide in English and Spanish.
+- No paid AI API.
 
-- Basis Weight calculations
-- Feet calculations
-- S-Wrap calculations
-- 48-inch and 51-inch mandrel memory per user
-- English and Spanish text
-- English and Spanish Telegram voice notes
-- No OpenAI key and no paid speech API
-- Voice processing with Vosk and FFmpeg
+## New chemical examples
 
-## Voice examples
+```text
+/chemical acetone
+/chemical 67-64-1
+cloro
+What is sodium hydroxide?
+¿Qué es el ácido muriático?
+```
 
-Say one of these in a Telegram voice note:
+Photo:
+- Send a clear, straight-on picture of the complete product label.
+- Viejito reads the name/CAS with OCR and verifies it in PubChem.
+- It refuses to identify an unlabeled liquid by appearance alone.
 
-- “Six hundred twenty pounds, eight thousand five hundred fifty feet.”
-- “Seiscientas veinte libras, ocho mil quinientos cincuenta pies.”
-- “Current weight seven point two five, speed one fifty, target six point three.”
-- “Peso actual siete punto dos cinco, velocidad ciento cincuenta, objetivo seis punto tres.”
-- “Mandrel fifty one.”
-- “Mandril cuarenta y ocho.”
+Emergency examples:
 
-The bot displays what it understood before returning the result.
+```text
+I got Clorox on my skin
+Me cayó cloro en el ojo
+I inhaled solvent
+Se derramó acetona
+```
+
+Emergency detection runs before calculator classification, so safety messages no longer fall through to “calculation not identified.”
+
+## Important limitations
+
+- PubChem is a broad chemical database, not the manufacturer's SDS.
+- A brand product may be a mixture with concentrations and additives that differ from a pure compound.
+- For workplace action, use the exact manufacturer's SDS and plant emergency procedure.
+- OCR can misread blurred, curved, reflective, damaged, or incomplete labels.
+- Viejito never identifies a chemical from color, smell, or liquid appearance alone.
 
 ## Railway deployment
 
-1. Upload all files in this project to the GitHub repository.
-2. Keep the existing Railway variable named `BOT_TOKEN`.
-3. Railway detects the `Dockerfile`, installs FFmpeg, and downloads the official small English and Spanish Vosk models during the build.
-4. Wait for **Deployment successful**.
-5. Test text first, then send a Telegram voice note.
+Required environment variable:
 
-The first Docker build is slower because it downloads approximately 80 MB of language models.
+```text
+BOT_TOKEN=your_telegram_bot_token
+```
 
-## Commands
+Railway builds the Dockerfile. It installs:
+- FFmpeg
+- Vosk models
+- Tesseract OCR English and Spanish
+- Pillow and pytesseract
 
-- `/start`
-- `/help`
-- `/bw 620 8550`
-- `/ft 5.71 620`
-- `/swrap 7.25 150 6.3`
-- `/mandrel 48`
-- `/mandrel 51`
-- `/language auto`
-- `/language es`
-- `/language en`
+After deployment, test:
 
-`/language auto` tries both language models and chooses the best result. Selecting `es` or `en` is faster and uses less memory.
+```text
+I got Clorox in my skin
+Cloro
+/chemical 67-64-1
+```
 
-## Privacy and cost
-
-Vosk performs speech recognition inside the Railway container. Voice notes are downloaded temporarily, converted, transcribed, and deleted when processing finishes. No paid speech API is used.
+Then send a clear photo of a chemical label.

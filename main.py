@@ -7,9 +7,15 @@ import random
 import re
 import subprocess
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 import wave
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+import pytesseract
 
 from telegram import BotCommand, Update
 from telegram.ext import (
@@ -32,7 +38,42 @@ MODEL_PATHS = {
     "es": MODEL_ROOT / "vosk-model-small-es-0.42",
 }
 MAX_VOICE_SECONDS = 30
+MAX_PHOTO_BYTES = 12 * 1024 * 1024
+PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest"
+PUBCHEM_TIMEOUT = 12
+CAS_PATTERN = re.compile(r"\b\d{2,7}-\d{2}-\d\b")
 
+# Common names/brands are normalized before the PubChem search. Commercial
+# mixtures still require the manufacturer's exact SDS.
+CHEMICAL_ALIASES = {
+    "cloro": "sodium hypochlorite",
+    "clorox": "sodium hypochlorite",
+    "bleach": "sodium hypochlorite",
+    "lejia": "sodium hypochlorite",
+    "lejía": "sodium hypochlorite",
+    "chlorine bleach": "sodium hypochlorite",
+    "chlorine": "chlorine",
+    "acetona": "acetone",
+    "alcohol isopropilico": "isopropyl alcohol",
+    "alcohol isopropílico": "isopropyl alcohol",
+    "isopropanol": "isopropyl alcohol",
+    "amoniaco": "ammonia",
+    "amoníaco": "ammonia",
+    "acido muriatico": "hydrochloric acid",
+    "ácido muriático": "hydrochloric acid",
+    "muriatic acid": "hydrochloric acid",
+    "acido sulfurico": "sulfuric acid",
+    "ácido sulfúrico": "sulfuric acid",
+    "acido nitrico": "nitric acid",
+    "ácido nítrico": "nitric acid",
+    "soda caustica": "sodium hydroxide",
+    "soda cáustica": "sodium hydroxide",
+    "caustic soda": "sodium hydroxide",
+    "peroxido": "hydrogen peroxide",
+    "peróxido": "hydrogen peroxide",
+    "agua oxigenada": "hydrogen peroxide",
+    "thinner": "paint thinner",
+}
 
 POISON_CONTROL_US = "1-800-222-1222"
 
@@ -353,35 +394,47 @@ def normalize_safety_text(text: str) -> str:
 
 
 def detect_safety_intent(text: str) -> Optional[str]:
-    """Detect urgent chemical exposure or SDS questions in English or Spanish."""
+    """Detect urgent chemical exposure before calculators or general search."""
     t = normalize_safety_text(text)
 
     if re.search(r"\b(sds|safety data sheet|hoja de seguridad|hoja de datos de seguridad)\b", t):
         return "sds"
 
-    chemical_terms = (
-        "chemical", "quimico", "bleach", "cloro", "chlorine", "acid", "acido",
-        "solvent", "solvente", "acetone", "acetona", "ammonia", "amoniaco",
-        "caustic", "caustico", "cleaner", "limpiador", "degreaser", "desengrasante",
-        "paint", "pintura", "resin", "resina", "adhesive", "pegamento",
-    )
-    exposure_terms = (
-        "me cayo", "me eche", "me salpico", "entro en", "en el ojo", "en mis ojos",
-        "en la piel", "en mi mano", "lo respire", "respire", "inhale", "inhaled",
-        "swallowed", "ingeri", "trague", "bebí", "bebi", "derrame", "spill",
-        "splashed", "got in my eye", "in my eyes", "on my skin", "can\'t breathe",
-        "cannot breathe", "no puedo respirar", "me queme", "burned me",
-    )
-    if any(term in t for term in exposure_terms) and any(term in t for term in chemical_terms):
-        if re.search(r"\b(ojo|ojos|eye|eyes)\b", t): return "eye"
-        if re.search(r"\b(respire|inhale|inhaled|breath|respirar|pulmon|lungs?)\b", t): return "inhalation"
-        if re.search(r"\b(piel|mano|brazo|skin|hand|arm)\b", t): return "skin"
-        if re.search(r"\b(trague|ingeri|bebi|swallowed|drank|ingested)\b", t): return "ingestion"
-        if re.search(r"\b(derrame|spill|leak|fuga)\b", t): return "spill"
-        return "general_exposure"
-
-    if re.search(r"\b(no puedo respirar|cannot breathe|can\'t breathe|difficulty breathing|dificultad para respirar)\b", t):
+    # Route/severity language is enough to trigger safety mode. Requiring a
+    # known chemical name caused phrases such as "I got Clorox in my skin" to
+    # fall through to the calculator.
+    if re.search(
+        r"\b(no puedo respirar|cannot breathe|can't breathe|difficulty breathing|"
+        r"dificultad para respirar|shortness of breath|falta de aire)\b",
+        t,
+    ):
         return "inhalation"
+
+    exposure_verbs = (
+        "me cayo", "me eche", "me salpico", "me mojo", "entro", "contacto",
+        "respire", "inhale", "inhaled", "breathed", "swallowed", "ingested",
+        "trague", "ingeri", "bebi", "derrame", "spilled", "spill", "splashed",
+        "got", "poured", "burned", "me queme", "exposure", "expuesto",
+    )
+    route_eye = re.search(r"\b(ojo|ojos|eye|eyes)\b", t)
+    route_skin = re.search(r"\b(piel|mano|manos|brazo|brazos|cara|skin|hand|hands|arm|arms|face)\b", t)
+    route_inhale = re.search(r"\b(respire|respirar|inhale|inhaled|breathed|breath|pulmon|lungs?|vapou?r|humo|fumes?)\b", t)
+    route_ingest = re.search(r"\b(trague|ingeri|bebi|boca|swallowed|ingested|drank|mouth)\b", t)
+    route_spill = re.search(r"\b(derrame|derramo|spill|spilled|leak|fuga)\b", t)
+
+    has_exposure = any(term in t for term in exposure_verbs)
+    if has_exposure or route_spill:
+        if route_eye:
+            return "eye"
+        if route_inhale:
+            return "inhalation"
+        if route_skin:
+            return "skin"
+        if route_ingest:
+            return "ingestion"
+        if route_spill:
+            return "spill"
+        return "general_exposure"
     return None
 
 
@@ -580,6 +633,348 @@ async def sds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         sds_help_text(language, section), parse_mode="Markdown"
     )
 
+
+
+def normalize_chemical_query(query: str) -> str:
+    cleaned = normalize_safety_text(query)
+    cleaned = re.sub(
+        r"^/?(?:chemical|chem|quimico|químico|buscar|search|lookup|what is|"
+        r"que es|qué es|dime sobre|tell me about)\s*[:\-]?\s*",
+        "",
+        cleaned,
+    ).strip(" .,:;!?")
+    return CHEMICAL_ALIASES.get(cleaned, cleaned)
+
+
+def looks_like_chemical_query(text: str) -> bool:
+    t = normalize_safety_text(text).strip()
+    if CAS_PATTERN.search(t):
+        return True
+    if t.startswith(("/chemical", "/chem", "/quimico", "/químico")):
+        return True
+    if any(alias in t for alias in CHEMICAL_ALIASES):
+        return True
+    patterns = (
+        r"\b(what is|tell me about|chemical info|search chemical)\b",
+        r"\b(que es|qué es|informacion del quimico|información del químico|busca el quimico)\b",
+        r"\b(cas|formula molecular|molecular formula|pictograma|pictogram|ghs)\b",
+    )
+    return any(re.search(pattern, t) for pattern in patterns)
+
+
+def _http_json(url: str) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Viejito-Industrial-Assistant/3.0"},
+    )
+    with urllib.request.urlopen(request, timeout=PUBCHEM_TIMEOUT) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _pubchem_identifier_path(query: str) -> tuple[str, str]:
+    cas = CAS_PATTERN.search(query)
+    if cas:
+        return "name", cas.group(0)
+    return "name", normalize_chemical_query(query)
+
+
+def _first_pubchem_cid(query: str) -> int:
+    namespace, identifier = _pubchem_identifier_path(query)
+    encoded = urllib.parse.quote(identifier, safe="")
+    data = _http_json(f"{PUBCHEM_BASE}/pug/compound/{namespace}/{encoded}/cids/JSON")
+    cids = data.get("IdentifierList", {}).get("CID", [])
+    if not cids:
+        raise LookupError("No PubChem compound found")
+    return int(cids[0])
+
+
+def _pubchem_properties(cid: int) -> dict[str, Any]:
+    fields = "Title,MolecularFormula,MolecularWeight,IUPACName,CanonicalSMILES,IsomericSMILES"
+    data = _http_json(
+        f"{PUBCHEM_BASE}/pug/compound/cid/{cid}/property/{fields}/JSON"
+    )
+    rows = data.get("PropertyTable", {}).get("Properties", [])
+    return rows[0] if rows else {}
+
+
+def _pubchem_synonyms(cid: int) -> list[str]:
+    data = _http_json(f"{PUBCHEM_BASE}/pug/compound/cid/{cid}/synonyms/JSON")
+    info = data.get("InformationList", {}).get("Information", [])
+    return list(info[0].get("Synonym", [])) if info else []
+
+
+def _find_cas(synonyms: list[str]) -> Optional[str]:
+    for synonym in synonyms:
+        match = CAS_PATTERN.fullmatch(synonym.strip())
+        if match:
+            return match.group(0)
+    return None
+
+
+def _collect_pugview_strings(node: Any, heading_words: tuple[str, ...], output: list[str]) -> None:
+    if isinstance(node, dict):
+        heading = str(node.get("TOCHeading", "")).lower()
+        in_target = any(word in heading for word in heading_words)
+        if in_target:
+            for info in node.get("Information", []):
+                value = info.get("Value", {})
+                strings = value.get("StringWithMarkup", [])
+                for item in strings:
+                    string = re.sub(r"\s+", " ", str(item.get("String", ""))).strip()
+                    if string and string not in output:
+                        output.append(string)
+        for value in node.values():
+            _collect_pugview_strings(value, heading_words, output)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_pugview_strings(item, heading_words, output)
+
+
+def _pubchem_hazard_snippets(cid: int) -> list[str]:
+    """Retrieve a few safety snippets; this is not a manufacturer SDS."""
+    try:
+        data = _http_json(f"{PUBCHEM_BASE}/pug_view/data/compound/{cid}/JSON")
+    except Exception:
+        return []
+    snippets: list[str] = []
+    _collect_pugview_strings(
+        data,
+        (
+            "ghs classification",
+            "hazard statements",
+            "health hazards",
+            "first aid",
+            "incompatibilities",
+        ),
+        snippets,
+    )
+    cleaned: list[str] = []
+    for snippet in snippets:
+        if len(snippet) > 600:
+            snippet = snippet[:597].rstrip() + "..."
+        if snippet not in cleaned:
+            cleaned.append(snippet)
+        if len(cleaned) >= 4:
+            break
+    return cleaned
+
+
+def lookup_pubchem(query: str) -> dict[str, Any]:
+    cid = _first_pubchem_cid(query)
+    properties = _pubchem_properties(cid)
+    synonyms = _pubchem_synonyms(cid)
+    return {
+        "cid": cid,
+        "title": properties.get("Title") or properties.get("IUPACName") or query,
+        "iupac": properties.get("IUPACName"),
+        "formula": properties.get("MolecularFormula"),
+        "weight": properties.get("MolecularWeight"),
+        "cas": _find_cas(synonyms),
+        "synonyms": synonyms[:8],
+        "hazards": _pubchem_hazard_snippets(cid),
+    }
+
+
+def chemical_result_text(result: dict[str, Any], language: str, *, photo: bool = False) -> str:
+    title = result.get("title") or "Unknown"
+    cas = result.get("cas") or ("No identificado" if language == "es" else "Not identified")
+    formula = result.get("formula") or "—"
+    weight = result.get("weight") or "—"
+    hazards = result.get("hazards") or []
+
+    if language == "es":
+        intro = "📷 *Posible identificación por la etiqueta*" if photo else "🧪 *Información química*"
+        lines = [
+            intro,
+            "",
+            f"*Nombre:* {title}",
+            f"*CAS:* {cas}",
+            f"*Fórmula:* `{formula}`",
+            f"*Peso molecular:* {weight}",
+            f"*PubChem CID:* {result.get('cid')}",
+        ]
+        if hazards:
+            lines.extend(["", "*Datos de peligro encontrados en PubChem:*"])
+            for item in hazards[:3]:
+                lines.append(f"• {item}")
+        lines.extend([
+            "",
+            "⚠️ *Esto no sustituye la SDS del fabricante.* En mezclas comerciales, la concentración y los ingredientes pueden cambiar los primeros auxilios, PPE e incompatibilidades.",
+            "Para una emergencia, sigue primero el lavaojos/ducha, el procedimiento de la planta y la Sección 4 de la SDS.",
+        ])
+        return "\n".join(lines)
+
+    intro = "📷 *Possible label identification*" if photo else "🧪 *Chemical information*"
+    lines = [
+        intro,
+        "",
+        f"*Name:* {title}",
+        f"*CAS:* {cas}",
+        f"*Formula:* `{formula}`",
+        f"*Molecular weight:* {weight}",
+        f"*PubChem CID:* {result.get('cid')}",
+    ]
+    if hazards:
+        lines.extend(["", "*Hazard information found in PubChem:*"])
+        for item in hazards[:3]:
+            lines.append(f"• {item}")
+    lines.extend([
+        "",
+        "⚠️ *This does not replace the manufacturer's SDS.* Commercial mixtures may have different concentrations and ingredients that change first aid, PPE, and incompatibilities.",
+        "For an emergency, follow the eyewash/shower procedure, the plant response plan, and SDS Section 4 first.",
+    ])
+    return "\n".join(lines)
+
+
+async def chemical_lookup_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    query: str,
+    *,
+    photo: bool = False,
+) -> None:
+    language = get_response_language(update, context)
+    normalized = normalize_chemical_query(query)
+    if not normalized:
+        prompt = (
+            "Escribe el nombre o CAS, por ejemplo: `/chemical acetona` o `/chemical 67-64-1`."
+            if language == "es"
+            else "Enter a name or CAS, for example: `/chemical acetone` or `/chemical 67-64-1`."
+        )
+        await update.effective_message.reply_text(prompt, parse_mode="Markdown")
+        return
+
+    status = await update.effective_message.reply_text(
+        "🔎 Buscando en PubChem…" if language == "es" else "🔎 Searching PubChem…"
+    )
+    try:
+        cache = context.bot_data.setdefault("chemical_cache", {})
+        key = normalized.lower()
+        result = cache.get(key)
+        if not result:
+            result = await asyncio.to_thread(lookup_pubchem, normalized)
+            if len(cache) >= 100:
+                cache.pop(next(iter(cache)))
+            cache[key] = result
+        await status.edit_text(
+            chemical_result_text(result, language, photo=photo),
+            parse_mode="Markdown",
+        )
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, LookupError, ValueError):
+        logger.info("Chemical lookup failed for %r", normalized, exc_info=True)
+        message = (
+            "No encontré una coincidencia segura. Escribe el nombre exacto, fabricante o número CAS. "
+            "Para una mezcla comercial, envía una foto clara de toda la etiqueta o la SDS."
+            if language == "es"
+            else
+            "I could not find a reliable match. Enter the exact name, manufacturer, or CAS number. "
+            "For a commercial mixture, send a clear photo of the full label or its SDS."
+        )
+        await status.edit_text(message)
+
+
+def preprocess_label_image(path: Path) -> Image.Image:
+    image = Image.open(path)
+    image = ImageOps.exif_transpose(image).convert("L")
+    image.thumbnail((2200, 2200))
+    image = ImageOps.autocontrast(image)
+    image = ImageEnhance.Contrast(image).enhance(1.8)
+    return image.filter(ImageFilter.SHARPEN)
+
+
+def ocr_label(path: Path) -> str:
+    image = preprocess_label_image(path)
+    # English data recognizes many product names; Spanish adds label phrases.
+    return pytesseract.image_to_string(image, lang="eng+spa", config="--psm 6")
+
+
+def choose_chemical_candidate(ocr_text: str) -> Optional[str]:
+    normalized = normalize_safety_text(ocr_text)
+    cas = CAS_PATTERN.search(normalized)
+    if cas:
+        return cas.group(0)
+
+    # Prefer exact common names/brands found anywhere on the label.
+    for alias in sorted(CHEMICAL_ALIASES, key=len, reverse=True):
+        if normalize_safety_text(alias) in normalized:
+            return CHEMICAL_ALIASES[alias]
+
+    ignored = (
+        "danger", "warning", "caution", "peligro", "advertencia", "precaucion",
+        "keep out", "mantenga", "first aid", "primeros auxilios", "directions",
+        "ingredients", "ingredientes", "net contents", "contenido neto",
+    )
+    candidates: list[tuple[int, str]] = []
+    for raw_line in ocr_text.splitlines():
+        line = re.sub(r"[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9(),.+\-/ ]", " ", raw_line)
+        line = re.sub(r"\s+", " ", line).strip()
+        low = normalize_safety_text(line)
+        if not (3 <= len(line) <= 80) or any(word in low for word in ignored):
+            continue
+        words = line.split()
+        if not (1 <= len(words) <= 8):
+            continue
+        score = sum(ch.isalpha() for ch in line)
+        if line.isupper():
+            score += 10
+        if any(token in low for token in ("acid", "acido", "chlor", "hypochlor", "hydrox", "acet", "ammon", "peroxid", "solvent")):
+            score += 25
+        candidates.append((score, line))
+    return max(candidates, default=(0, ""))[1] or None
+
+
+async def chemical_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.effective_message.text or ""
+    query = re.sub(r"^/\w+(?:@\w+)?\s*", "", text).strip()
+    await chemical_lookup_reply(update, context, query)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.photo:
+        return
+    language = get_response_language(update, context)
+    status = await message.reply_text(
+        "📷 Leyendo la etiqueta…" if language == "es" else "📷 Reading the label…"
+    )
+    try:
+        largest = message.photo[-1]
+        if largest.file_size and largest.file_size > MAX_PHOTO_BYTES:
+            await status.edit_text(
+                "La foto es demasiado grande." if language == "es" else "The photo is too large."
+            )
+            return
+        telegram_file = await context.bot.get_file(largest.file_id)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "label.jpg"
+            await telegram_file.download_to_drive(custom_path=str(image_path))
+            ocr_text = await asyncio.to_thread(ocr_label, image_path)
+        candidate = choose_chemical_candidate(ocr_text)
+        if not candidate:
+            await status.edit_text(
+                "⚠️ No pude leer un nombre o número CAS con suficiente seguridad. "
+                "Toma otra foto de frente, con buena luz y enfocando toda la etiqueta. "
+                "No puedo identificar de forma segura un líquido solo por su apariencia."
+                if language == "es"
+                else
+                "⚠️ I could not read a name or CAS number with enough confidence. "
+                "Take another straight-on, well-lit photo showing the full label. "
+                "I cannot safely identify a liquid from appearance alone."
+            )
+            return
+        await status.edit_text(
+            f"📷 Texto detectado: *{candidate}*\n"
+            + ("Verificando…" if language == "es" else "Verifying…"),
+            parse_mode="Markdown",
+        )
+        await chemical_lookup_reply(update, context, candidate, photo=True)
+    except Exception:
+        logger.exception("Photo/OCR processing failed")
+        await status.edit_text(
+            "No pude procesar la foto. Intenta otra vez con la etiqueta completa y enfocada."
+            if language == "es"
+            else "I could not process the photo. Try again with the complete label in focus."
+        )
 
 def calculate_bw(weight_lb: float, length_ft: float, mandrel_in: float) -> float:
     return (weight_lb * 453.59237) / ((length_ft * 12 * mandrel_in) / 100)
@@ -822,7 +1217,7 @@ def help_text(language: str, mandrel: float) -> str:
     voice_lang = "Auto"
     if language == "es":
         return (
-            "🤖 *Viejito — BW Assistant V2.4*\n\n"
+            "🤖 *Viejito — Industrial Assistant V3*\n\n"
             "✍️ Escribe o 🎤 manda una nota de voz.\n"
             f"Mandril actual: *{int(mandrel)}”*\n\n"
             "*BW:* `620 8550`\n"
@@ -832,11 +1227,12 @@ def help_text(language: str, mandrel: float) -> str:
             "Idioma automático: sigue la configuración de Telegram.\n"
             "Cambiar: `/language auto`, `/language es`, `/language en`\n"
             "Sarcasmo: `/sarcasm heavy`, `/sarcasm light`, `/sarcasm off`\n"
-            "Seguridad química/SDS: describe la exposición o usa `/sds`\n"
-            "Comandos: /bw /ft /swrap /mandrel /sds /language /sarcasm /help"
+            "Químicos: `/chemical acetona`, un número CAS o foto de la etiqueta.\n"
+            "Emergencias/SDS: describe la exposición o usa `/sds`\n"
+            "Comandos: /bw /ft /swrap /mandrel /chemical /sds /language /sarcasm /help"
         )
     return (
-        "🤖 *Viejito — BW Assistant V2.4*\n\n"
+        "🤖 *Viejito — Industrial Assistant V3*\n\n"
         "✍️ Type or 🎤 send a voice note.\n"
         f"Current mandrel: *{int(mandrel)}”*\n\n"
         "*BW:* `620 8550`\n"
@@ -846,8 +1242,9 @@ def help_text(language: str, mandrel: float) -> str:
         "Automatic language: follows your Telegram settings.\n"
         "Change: `/language auto`, `/language es`, `/language en`\n"
         "Sarcasm: `/sarcasm heavy`, `/sarcasm light`, `/sarcasm off`\n"
-        "Chemical safety/SDS: describe the exposure or use `/sds`\n"
-        "Commands: /bw /ft /swrap /mandrel /sds /language /sarcasm /help"
+        "Chemicals: `/chemical acetone`, a CAS number, or a label photo.\n"
+        "Emergencies/SDS: describe the exposure or use `/sds`\n"
+        "Commands: /bw /ft /swrap /mandrel /chemical /sds /language /sarcasm /help"
     )
 
 
@@ -1030,6 +1427,9 @@ async def process_text(
             sds_help_text(language, section), parse_mode="Markdown"
         )
         return
+    if looks_like_chemical_query(text):
+        await chemical_lookup_reply(update, context, text)
+        return
     sarcasm_choice = sarcasm_request(text)
     if sarcasm_choice is not None:
         original_text = update.effective_message.text
@@ -1192,13 +1592,14 @@ async def post_init(application: Application) -> None:
         BotCommand("ft", "Calculate feet"),
         BotCommand("swrap", "Calculate S-Wrap"),
         BotCommand("mandrel", "Set 48 or 51 inch mandrel"),
+        BotCommand("chemical", "Search chemical name or CAS"),
         BotCommand("sds", "SDS sections and chemical safety"),
         BotCommand("language", "Voice language: auto, en, es"),
         BotCommand("sarcasm", "Sarcasm: heavy, light, off"),
         BotCommand("help", "Examples / Ejemplos"),
     ]
     await application.bot.set_my_commands(commands)
-    logger.info("Viejito V2.4 started. Voice models: %s", MODEL_PATHS)
+    logger.info("Viejito V3 started. Voice models: %s", MODEL_PATHS)
 
 
 def main() -> None:
@@ -1219,9 +1620,13 @@ def main() -> None:
     application.add_handler(CommandHandler("ft", ft_command))
     application.add_handler(CommandHandler("swrap", swrap_command))
     application.add_handler(CommandHandler("mandrel", mandrel_command))
+    application.add_handler(CommandHandler("chemical", chemical_command))
+    application.add_handler(CommandHandler("chem", chemical_command))
+    application.add_handler(CommandHandler("quimico", chemical_command))
     application.add_handler(CommandHandler("sds", sds_command))
     application.add_handler(CommandHandler("language", language_command))
     application.add_handler(CommandHandler("sarcasm", sarcasm_command))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
